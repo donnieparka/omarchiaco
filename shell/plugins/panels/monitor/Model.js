@@ -122,3 +122,78 @@ if (typeof module !== "undefined") {
     parseDisplays: parseDisplays
   }
 }
+
+function isActive(display) {
+  return !!display && !display.disabled && Number(display.width) > 0 && Number(display.height) > 0
+}
+
+function monitorLabel(display) {
+  var name = /^(eDP|LVDS|DSI)-/.test(display.name) ? "Portatile" : (display.model || display.description || "Monitor")
+  return name + " · " + display.name
+}
+
+function presentMonitors(monitors) {
+  return monitors.map(function(display) {
+    return {
+      name: display.name,
+      model: display.model || "",
+      description: display.description || "",
+      width: display.width,
+      height: display.height,
+      refreshRate: display.refreshRate,
+      scale: display.scale,
+      transform: display.transform || 0,
+      disabled: !!display.disabled,
+      relation: display.relation || null,
+      availableModes: display.availableModes || []
+    }
+  }).sort(function(a, b) {
+    var aLaptop = /^(eDP|LVDS|DSI)-/.test(a.name)
+    var bLaptop = /^(eDP|LVDS|DSI)-/.test(b.name)
+    if (aLaptop !== bLaptop) return aLaptop ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+}
+
+function referenceName(references, requested) {
+  for (var i = 0; i < references.length; i++)
+    if (references[i].name === requested) return requested
+  return references.length ? references[0].name : ""
+}
+
+function alignmentOptions(side) {
+  var horizontal = side === "left" || side === "right"
+  return [
+    { value: "start", label: horizontal ? "In alto" : "A sinistra" },
+    { value: "center", label: "Al centro" },
+    { value: "end", label: horizontal ? "In basso" : "A destra" }
+  ]
+}
+
+function availableModes(display) {
+  var modes = display.availableModes || []
+  return modes.filter(function(mode, index) { return modes.indexOf(mode) === index })
+}
+
+function modeLabel(mode) {
+  return String(mode).replace("x", " × ").replace("@", " · ").replace(/Hz$/, " Hz")
+}
+
+function isCurrentMode(mode, display) {
+  var parts = /^(\d+)x(\d+)@([0-9.]+)(?:Hz)?$/.exec(String(mode))
+  return !!parts && Number(parts[1]) === Number(display.width) && Number(parts[2]) === Number(display.height)
+    && Math.abs(Number(parts[3]) - Number(display.refreshRate)) < 0.05
+}
+
+if (typeof module !== "undefined") {
+  Object.assign(module.exports, {
+    isActive: isActive,
+    monitorLabel: monitorLabel,
+    presentMonitors: presentMonitors,
+    referenceName: referenceName,
+    alignmentOptions: alignmentOptions,
+    availableModes: availableModes,
+    modeLabel: modeLabel,
+    isCurrentMode: isCurrentMode
+  })
+}

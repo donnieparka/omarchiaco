@@ -1,0 +1,12 @@
+#!/bin/bash
+# omarchy:summary=Click a validated target in a shell panel
+# omarchy:hidden=true
+
+set -euo pipefail
+[[ ($# == 2 || $# == 3) && ${3:-1} =~ ^[12]$ && $1 =~ ^-?[0-9]+$ && $2 =~ ^-?[0-9]+$ ]] || exit 2
+for attempt in 1 2; do
+  hyprctl dispatch "hl.dsp.cursor.move({ x = $1, y = $2 })" >/dev/null
+done
+read -r pointer_x pointer_y < <(hyprctl -j cursorpos | jq -r '[.x,.y] | @tsv')
+(( pointer_x >= $1 - 2 && pointer_x <= $1 + 2 && pointer_y >= $2 - 2 && pointer_y <= $2 + 2 )) || exit 1
+YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-${XDG_RUNTIME_DIR:?}/.ydotool_socket}" ydotool click --repeat "${3:-1}" --next-delay 80 0xC0

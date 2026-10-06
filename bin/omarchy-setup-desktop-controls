@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Build the native display controller
+
+set -euo pipefail
+
+make -C "$OMARCHY_PATH/default/native" \
+  BUILD_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/native" \
+  all install-monitor
+
+systemctl --user daemon-reload
+systemctl --user enable --now omarchy-monitor-control.service

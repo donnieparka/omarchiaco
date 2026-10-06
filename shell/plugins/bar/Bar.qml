@@ -1195,6 +1195,8 @@ Item {
   // changes land in quick succession, stranding the bar off screen until the
   // shell restarts. `omarchy-toggle-bar` nudges this after flipping the flag
   // so the probe re-reads it even when the watch has gone quiet.
+  PanelHints { barHost: root }
+
   ShellIpc {
     target: "omarchy.bar"
 

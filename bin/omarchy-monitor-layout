@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# omarchy:summary=Open display settings in the bar
+
+set -euo pipefail
+
+exec omarchy-shell shell summon omarchy.monitor '{}'
