@@ -1,0 +1,34 @@
+[general]
+modes=floating,split
+home_row_keys=asdfjklughb
+cancellation_status_code=0
+
+[mode_floating]
+source=detect
+label_symbols=abcdefghijklmnopqrstuvwxyz
+label_font_family=sans-serif
+label_font_size=14 50% 24
+label_color=#ffffffff
+label_select_color=#ffcc66ff
+unselectable_bg_color=#11182766
+selectable_bg_color=#11182722
+selectable_border_color=#93c5fd88
+
+[mode_tile]
+label_symbols=abcdefghijklmnopqrstuvwxyz
+label_font_family=sans-serif
+label_font_size=12 50% 30
+label_color=#ffffffff
+label_select_color=#ffcc66ff
+unselectable_bg_color=#11182788
+selectable_bg_color=#11182722
+selectable_border_color=#93c5fd88
+
+[mode_split]
+pointer_size=24
+pointer_color=#ffcc66ff
+bg_color=#11182744
+area_bg_color=#11182722
+vertical_color=#93c5fdff
+horizontal_color=#93c5fdff
+history_border_color=#93c5fd66

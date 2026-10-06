@@ -4,6 +4,12 @@ Omarchy is a beautiful, fun & agentic Linux distribution by DHH.
 
 Read more at [omarchy.org](https://omarchy.org).
 
+## Personalisation fork
+
+This fork adds monitor controls with relative placement and a 15-second restore timer, keyboard shortcuts inside tray panels, an SSH askpass dialog with caller context, and a separate smart keyboard mouse selector.
+
+The implementation, setup commands, and migration from the previous personalisation repository are documented in [the migration guide](docs/personalisation/migration.md).
+
 ## The Omarchy Manual
 
 The manual lives in [`manual/`](manual/), which is its authoritative source.

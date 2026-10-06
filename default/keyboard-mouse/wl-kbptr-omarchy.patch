@@ -1,0 +1,186 @@
+diff --git i/meson.build w/meson.build
+index 979df4d..35c6ac8 100644
+--- i/meson.build
++++ w/meson.build
+@@ -26,7 +26,10 @@ cc = meson.get_compiler('c')
+ if use_opencv
+   add_project_arguments('-DOPENCV_ENABLED=1', language: ['c', 'cpp'])
+   add_languages('cpp', native: false)
+-  opencv = dependency('opencv4')
++  opencv = dependency('opencv5', required: false)
++  if not opencv.found()
++    opencv = dependency('opencv4')
++  endif
+   pixman = dependency('pixman-1')
+ endif
+ 
+diff --git i/src/main.c w/src/main.c
+index 547b6c7..5477e7c 100644
+--- i/src/main.c
++++ w/src/main.c
+@@ -47,6 +47,7 @@ static void send_frame(struct state *state) {
+     cairo_scale(cairo, scale_120 / 120.0, scale_120 / 120.0);
+     mode_render(state, cairo);
+ 
++
+     wl_surface_set_buffer_scale(state->wl_surface, 1);
+ 
+     wl_surface_attach(state->wl_surface, surface_buffer->wl_buffer, 0, 0);
+@@ -870,7 +871,7 @@ int main(int argc, char **argv) {
+     state.wl_layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+         state.wl_layer_shell, state.wl_surface,
+         state.current_output == NULL ? NULL : state.current_output->wl_output,
+-        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "selection"
++        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "omarchy-keyboard-mouse"
+     );
+     zwlr_layer_surface_v1_add_listener(
+         state.wl_layer_surface, &wl_layer_surface_listener, &state
+@@ -907,6 +908,13 @@ int main(int argc, char **argv) {
+     wl_surface_commit(state.wl_surface);
+     while (state.running && wl_display_dispatch(state.wl_display)) {}
+ 
++    /* A queued frame must not use the viewport after it has been destroyed. */
++    state.running = false;
++    if (state.wl_surface_callback != NULL) {
++        wl_callback_destroy(state.wl_surface_callback);
++        state.wl_surface_callback = NULL;
++    }
++
+     wp_viewport_destroy(state.wp_viewport);
+ 
+     zwlr_layer_surface_v1_destroy(state.wl_layer_surface);
+diff --git i/src/mode_floating.c w/src/mode_floating.c
+index 4d927d0..949ddc1 100644
+--- i/src/mode_floating.c
++++ w/src/mode_floating.c
+@@ -62,6 +62,10 @@ static void get_area_from_screenshot(
+     area.w -= 2;
+ 
+     struct scrcpy_buffer    *scrcpy_buffer = query_screenshot(state, area);
++    if (scrcpy_buffer == NULL) {
++        LOG_ERR("Screen capture failed; use tile mode instead.");
++        exit(1);
++    }
+     enum wl_output_transform output_transform =
+         state->current_output->transform;
+     ms->num_areas = compute_target_from_img_buffer(
+@@ -75,7 +79,7 @@ static void get_area_from_screenshot(
+ #endif
+ 
+ void *floating_mode_enter(struct state *state, struct rect area) {
+-    struct floating_mode_state *ms = malloc(sizeof(*ms));
++    struct floating_mode_state *ms = calloc(1, sizeof(*ms));
+ 
+     ms->label_symbols =
+         label_symbols_from_str(state->config.mode_floating.label_symbols);
+@@ -103,6 +107,11 @@ void *floating_mode_enter(struct state *state, struct rect area) {
+         break;
+     }
+ 
++    if (ms->num_areas == 0) {
++        LOG_ERR("No targets detected; use tile mode instead.");
++        exit(1);
++    }
++
+     ms->label_selection = label_selection_new(ms->label_symbols, ms->num_areas);
+ 
+     ms->label_font_face = cairo_toy_font_face_create(
+diff --git i/src/mode_split.c w/src/mode_split.c
+index 8ab4a21..6a0d0d1 100644
+--- i/src/mode_split.c
++++ w/src/mode_split.c
+@@ -215,6 +215,22 @@ split_mode_render(struct state *state, void *mode_state, cairo_t *cairo) {
+         cairo, area, config->vertical_color, config->horizontal_color
+     );
+     split_mode_render_cursor(state, mode_state, cairo);
++
++    /* Put the guide on the opposite edge from the selected target. */
++    int guide_y = area->y + area->h / 2 < state->surface_height / 2
++                      ? state->surface_height - 26 : 0;
++    cairo_save(cairo);
++    cairo_set_operator(cairo, CAIRO_OPERATOR_OVER);
++    cairo_set_source_rgba(cairo, 0.05, 0.06, 0.09, 0.94);
++    cairo_rectangle(cairo, 0, guide_y, state->surface_width, 26);
++    cairo_fill(cairo);
++    cairo_select_font_face(cairo, "sans-serif", CAIRO_FONT_SLANT_NORMAL,
++                           CAIRO_FONT_WEIGHT_NORMAL);
++    cairo_set_font_size(cairo, 12);
++    cairo_set_source_rgb(cairo, 0.94, 0.95, 1);
++    cairo_move_to(cairo, 10, guide_y + 18);
++    cairo_show_text(cairo, "Frecce: rifinisci | Invio/G: clic | H: destro | B: centrale | Spazio: sposta | Backspace: indietro | Esc: esci");
++    cairo_restore(cairo);
+ }
+ 
+ static bool
+@@ -235,8 +251,8 @@ split_mode_split(struct state *state, void *mode_state, enum split_dir dir) {
+         if (area->w <= 1) {
+             return false; /* Cannot split further */
+         }
+-        new_area->w  = area->w / 2;
+-        new_area->x += new_area->w;
++        new_area->x += area->w / 2;
++        new_area->w  = area->w - area->w / 2;
+         break;
+ 
+     case SPLIT_DIR_LEFT:
+@@ -257,8 +273,8 @@ split_mode_split(struct state *state, void *mode_state, enum split_dir dir) {
+         if (area->h <= 1) {
+             return false; /* Cannot split further */
+         }
+-        new_area->h  = area->h / 2;
+-        new_area->y += new_area->h;
++        new_area->y += area->h / 2;
++        new_area->h  = area->h - area->h / 2;
+         break;
+     }
+ 
+@@ -279,6 +295,10 @@ static bool split_mode_key(
+         break;
+ 
+     case XKB_KEY_Return:
++        state->click = CLICK_LEFT_BTN;
++        enter_next_mode(state, ms->areas[ms->current]);
++        return true;
++
+     case XKB_KEY_space:
+         enter_next_mode(state, ms->areas[ms->current]);
+         return true;
+diff --git i/src/screencopy.c w/src/screencopy.c
+index 35399a3..60de43b 100644
+--- i/src/screencopy.c
++++ w/src/screencopy.c
+@@ -122,7 +122,7 @@ const struct zwlr_screencopy_frame_v1_listener screencopy_frame_listener = {
+ 
+ struct scrcpy_buffer *
+ query_screenshot(struct state *state, struct rect region) {
+-    struct scrcpy_state scrcpy_state;
++    struct scrcpy_state scrcpy_state = {0};
+     scrcpy_state.wl_shm = state->wl_shm;
+ 
+     if (state->wl_screencopy_manager == NULL) {
+@@ -152,6 +152,11 @@ query_screenshot(struct state *state, struct rect region) {
+ 
+     zwlr_screencopy_frame_v1_destroy(scrcpy_state.wl_screencopy_frame);
+ 
++    if (scrcpy_state.screen_capture_state != CAPTURE_SUCCESS) {
++        destroy_scrcpy_buffer(scrcpy_state.scrcpy_buffer);
++        return NULL;
++    }
++
+     return scrcpy_state.scrcpy_buffer;
+ }
+ 
+diff --git i/src/target_detection.cpp w/src/target_detection.cpp
+index 9c196de..8db50a2 100644
+--- i/src/target_detection.cpp
++++ w/src/target_detection.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include <opencv2/imgcodecs.hpp>
+ #include <opencv2/imgproc.hpp>
++#if CV_VERSION_MAJOR >= 5
++#include <opencv2/geometry/2d.hpp>
++#endif
+ #include <pixman.h>
+ #include <stdint.h>
+ #include <stdlib.h>

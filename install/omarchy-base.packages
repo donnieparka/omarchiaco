@@ -65,6 +65,7 @@ inotify-tools
 inxi
 networkmanager
 jq
+json-c
 kdenlive
 kernel-modules-hook
 lazygit

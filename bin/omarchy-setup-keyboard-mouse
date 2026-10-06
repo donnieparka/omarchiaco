@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# omarchy:summary=Install the separate smart keyboard pointer selector
+
+set -euo pipefail
+
+omarchy-pkg-add base-devel meson ninja wayland wayland-protocols libxkbcommon cairo opencv ydotool
+source_dir="${XDG_DATA_HOME:-$HOME/.local/share}/keyboard-mouse/wl-kbptr"
+expected_commit="6191d1725515830b8c51db25b57f9eeceb1565e5"
+
+if [[ ! -e $source_dir ]]; then
+  git clone --branch v0.4.1 --depth 1 https://github.com/moverest/wl-kbptr.git "$source_dir"
+fi
+if [[ $(git -C "$source_dir" rev-parse HEAD) != "$expected_commit" ]]; then
+  echo "The wl-kbptr checkout differs from the supported version." >&2
+  exit 1
+fi
+
+patch_file="$OMARCHY_PATH/default/keyboard-mouse/wl-kbptr-omarchy.patch"
+if git -C "$source_dir" apply --check "$patch_file"; then
+  git -C "$source_dir" apply "$patch_file"
+elif ! git -C "$source_dir" apply --reverse --check "$patch_file"; then
+  echo "The wl-kbptr changes differ from the supported patch." >&2
+  exit 1
+fi
+
+if [[ -d $source_dir/build ]]; then
+  meson setup "$source_dir/build" "$source_dir" --reconfigure --buildtype=release -Dopencv=enabled
+else
+  meson setup "$source_dir/build" "$source_dir" --buildtype=release -Dopencv=enabled
+fi
+meson compile -C "$source_dir/build"
+install -Dm755 "$source_dir/build/wl-kbptr" "$HOME/.local/bin/wl-kbptr-omarchy"
+
+if [[ ! -f $HOME/.config/wl-kbptr/config ]]; then
+  install -Dm644 "$OMARCHY_PATH/config/wl-kbptr/config" "$HOME/.config/wl-kbptr/config"
+fi
+
+omarchy-dev-install-ydoo
+systemctl --user enable ydotool.service

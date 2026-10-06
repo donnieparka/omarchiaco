@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy.ssh-askpass",
+  "name": "SSH Askpass",
+  "version": "1.1.0",
+  "author": "iaco",
+  "description": "Omarchy-styled SSH authentication with observed caller context",
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  },
+  "omarchy": {
+    "capabilities": [
+      "authentication"
+    ]
+  }
+}

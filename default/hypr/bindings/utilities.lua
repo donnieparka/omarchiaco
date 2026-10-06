@@ -126,3 +126,7 @@ o.bind("SUPER + CTRL + ALT + Z", "Reset zoom", function()
 end)
 
 o.bind("SUPER + CTRL + L", "Lock system", "omarchy-system-lock")
+
+-- Keyboard pointer selection is separate from the shortcuts in bar panels.
+o.bind("SUPER + CTRL + M", "Mouse da tastiera: smart", "omarchy-keyboard-mouse smart")
+o.bind("SUPER + CTRL + SHIFT + M", "Mouse da tastiera: griglia", "omarchy-keyboard-mouse grid")

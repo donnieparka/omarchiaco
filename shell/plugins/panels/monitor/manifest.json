@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "omarchy.monitor",
   "name": "Display",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Omarchy",
-  "description": "Brightness slider and laptop display controls",
+  "description": "Monitor controls and persistent relative layouts with timed confirmation",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Display",
-    "description": "Brightness slider and laptop display controls",
+    "description": "Monitor controls and persistent relative layouts with timed confirmation",
     "category": "System",
     "allowMultiple": false
   }

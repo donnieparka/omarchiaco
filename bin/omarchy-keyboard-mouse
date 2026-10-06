@@ -1,0 +1,67 @@
+#!/bin/bash
+# omarchy:summary=Select and click a pointer target with keyboard labels
+# omarchy:group=display
+# omarchy:name=keyboard-mouse
+# omarchy:args=[smart|grid] [monitor]
+
+set -euo pipefail
+
+# An invocation owns the overlay until it closes; repeated shortcuts do not
+# stack keyboard grabs. Hyprland chooses the focused output at invocation.
+exec 9>"${XDG_RUNTIME_DIR:?}/omarchy-keyboard-mouse.lock"
+flock -n 9 || exit 0
+
+pointer_bin="$HOME/.local/bin/wl-kbptr-omarchy"
+if [[ ! -x "$pointer_bin" ]]; then
+  omarchy-notification-send 'Mouse da tastiera' 'Manca wl-kbptr-omarchy. Vedi la guida keyboard-mouse.md.'
+  exit 1
+fi
+
+mode="${1:-smart}"
+case "$mode" in
+  smart) options=() ;;
+  grid) options=(-o modes=tile,split) ;;
+  *) printf 'Uso: omarchy-keyboard-mouse [smart|grid]\n' >&2; exit 2 ;;
+esac
+output="${2:-$(hyprctl -j monitors | jq -er '.[] | select(.focused) | .name')}"
+if ! result="$("$pointer_bin" -p -c "$HOME/.config/wl-kbptr/config" -O "$output" "${options[@]}")"; then
+  if [[ "$mode" == smart ]]; then
+    omarchy-notification-send 'Mouse da tastiera' 'Rilevamento smart non disponibile. Apro la griglia.'
+    result="$("$pointer_bin" -p -c "$HOME/.config/wl-kbptr/config" -O "$output" -o modes=tile,split)"
+  else
+    omarchy-notification-send 'Mouse da tastiera' 'Impossibile aprire la griglia sul monitor selezionato.'
+    exit 1
+  fi
+fi
+
+# Esc returns no selection. Convert output-local coordinates to Hyprland's
+# logical desktop coordinates, including negative positions and rotated screens.
+[[ -n "$result" ]] || exit 0
+if [[ ! "$result" =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)\ \+(-?[0-9]+)\+(-?[0-9]+)\ ([lmrn])$ ]]; then
+  omarchy-notification-send 'Mouse da tastiera' 'Il selettore ha restituito coordinate non valide.'
+  exit 1
+fi
+target_x=$((BASH_REMATCH[5] + BASH_REMATCH[3] + BASH_REMATCH[1] / 2))
+target_y=$((BASH_REMATCH[6] + BASH_REMATCH[4] + BASH_REMATCH[2] / 2))
+button="${BASH_REMATCH[7]}"
+
+# A first move can activate another monitor and trigger a workspace cursor warp.
+# A second move puts the pointer at the target after that activation.
+for attempt in 1 2; do
+  hyprctl dispatch "hl.dsp.cursor.move({ x = $target_x, y = $target_y })" >/dev/null
+done
+read -r actual_x actual_y < <(hyprctl -j cursorpos | jq -r '[.x,.y] | @tsv')
+if (( actual_x < target_x - 2 || actual_x > target_x + 2 ||
+      actual_y < target_y - 2 || actual_y > target_y + 2 )); then
+  omarchy-notification-send 'Mouse da tastiera' 'Il puntatore non ha raggiunto il punto scelto. Riprova.'
+  exit 1
+fi
+
+# The existing user ydotool service sends a click at the validated position.
+export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-$XDG_RUNTIME_DIR/.ydotool_socket}"
+case "$button" in
+  l) ydotool click 0xC0 ;;
+  r) ydotool click 0xC1 ;;
+  m) ydotool click 0xC2 ;;
+  n) ;; # Space only positions the pointer.
+esac

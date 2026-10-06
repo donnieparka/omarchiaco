@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# omarchy:summary=Build the native display controller and SSH askpass helper
+
+set -euo pipefail
+
+make -C "$OMARCHY_PATH/default/native" \
+  BUILD_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/native" \
+  all install install-monitor
+
+mkdir -p "$HOME/.config/environment.d"
+printf 'SSH_ASKPASS=%s\nSSH_ASKPASS_REQUIRE=prefer\n' \
+  "$HOME/.local/bin/omarchy-ssh-askpass" \
+  >"$HOME/.config/environment.d/omarchy-ssh-askpass.conf"
+
+systemctl --user daemon-reload
+systemctl --user enable --now omarchy-monitor-control.service
