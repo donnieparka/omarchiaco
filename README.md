@@ -4,6 +4,10 @@ Omarchy is a beautiful, fun & agentic Linux distribution by DHH.
 
 Read more at [omarchy.org](https://omarchy.org).
 
+## Display controls and tray shortcuts
+
+This fork adds monitor mode selection, relative placement, rotation, scale, activation, and a 15-second restore timer. Tray panels show keyboard labels beside their controls, including dynamic Wi-Fi and Bluetooth entries. See [setup and verification](docs/personalisation/display-controls.md).
+
 ## The Omarchy Manual
 
 The manual lives in [`manual/`](manual/), which is its authoritative source.

@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# omarchy:summary=Apply a display change using the native controller
+# omarchy:hidden=true
+
+set -euo pipefail
+
+exec "$HOME/.local/bin/omarchy-monitor-apply" "$@"

@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# omarchy:summary=Manage display modes, rotation and relative positions
+# omarchy:args=<status|open|daemon|preview|apply|confirm|revert> [args...]
+
+set -euo pipefail
+
+exec "$HOME/.local/bin/omarchy-monitor-control" "$@"
