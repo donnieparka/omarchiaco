@@ -13,14 +13,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define FILE_LIMIT (4U * 1024U * 1024U)
 #define COMMAND_TIMEOUT 5000
+/* Hyprland has no event for every EDID/mode or direct keyword change. */
+#ifndef MONITOR_RECHECK_MS
+#define MONITOR_RECHECK_MS 60000
+#endif
 #ifndef MONITOR_CONFIRM_SECONDS
 #define MONITOR_CONFIRM_SECONDS 15
 #endif
@@ -229,7 +236,7 @@ static bool active(json_object *m) {
     return m && !json_object_get_boolean(get(m, "disabled")) && num(m, "width") > 0 && num(m, "height") > 0;
 }
 static bool same_output(json_object *actual, json_object *expected) {
-    if (!actual) return false;
+    if (!actual || strcmp(str(actual, "model"), str(expected, "model"))) return false;
     bool disabled = json_object_get_boolean(get(expected, "disabled"));
     if (disabled) return !active(actual);
     if (!active(actual)) return false;
@@ -237,17 +244,20 @@ static bool same_output(json_object *actual, json_object *expected) {
     for (size_t i = 0; keys[i]; i++) if (num(actual, keys[i]) != num(expected, keys[i])) return false;
     return fabs(num(actual, "scale") - num(expected, "scale")) < 0.005 && fabs(num(actual, "refreshRate") - num(expected, "refreshRate")) < 0.08;
 }
+static bool plan_applied(json_object *live, json_object *planned) {
+    if (!live) return false;
+    for (size_t i = 0; i < json_object_array_length(planned); i++) {
+        json_object *m = json_object_array_get_idx(planned, i);
+        if (!same_output(find_monitor(live, str(m, "name")), m)) return false;
+    }
+    return true;
+}
 static bool verify_plan(json_object *planned) {
     int64_t deadline = millis() + 2500;
     do {
-        json_object *live = live_monitors(); bool matches = live != NULL;
-        if (live) {
-            for (size_t i = 0; i < json_object_array_length(planned); i++) {
-                json_object *m = json_object_array_get_idx(planned, i);
-                if (!same_output(find_monitor(live, str(m, "name")), m)) matches = false;
-            }
-            json_object_put(live);
-        }
+        json_object *live = live_monitors();
+        bool matches = plan_applied(live, planned);
+        json_object_put(live);
         if (matches) return true;
         nap(100);
     } while (!stopped && millis() < deadline);
@@ -383,36 +393,34 @@ static int status_command(void) {
     if (!live) return emit_error();
     json_object *state = load_state(live);
     if (!state) { json_object_put(live); return emit_error(); }
-    json_object *o = json_object_new_object();
     json_object *inventory = monitor_initial_state(live);
-    json_object *outputs = get(inventory, "outputs");
-    if (outputs) {
-        json_object_object_foreach(outputs, id, saved) {
-            json_object *m = find_monitor(live, str(saved, "name"));
-            if (!m) continue;
-            json_object_object_add(m, "id", json_object_new_string(id));
-            json_object_object_add(m, "relation", NULL);
-            json_object *relations = get(state, "relations");
-            for (size_t i = 0; i < json_object_array_length(relations); i++) {
-                json_object *r = json_object_array_get_idx(relations, i);
-                if (strcmp(str(r, "monitor"), id)) continue;
-                json_object *ref = get(outputs, str(r, "reference"));
-                if (!ref) continue;
-                json_object *relation = json_object_new_object();
-                json_object_object_add(relation, "reference", json_object_new_string(str(ref, "name")));
-                json_object_object_add(relation, "direction", json_object_get(get(r, "direction")));
-                json_object_object_add(relation, "alignment", json_object_get(get(r, "alignment")));
-                json_object_object_add(m, "relation", relation);
-            }
-        }
+    if (!inventory) {
+        json_object_put(state); json_object_put(live);
+        fail("Modello monitor mancante o più monitor collegati con lo stesso modello");
+        return emit_error();
     }
     json_object_put(inventory);
+    for (size_t i = 0; i < json_object_array_length(live); ++i) {
+        json_object *m = json_object_array_get_idx(live, i);
+        size_t length = strlen(str(m, "model")) + sizeof "model:";
+        char *id = malloc(length);
+        if (!id) {
+            json_object_put(state); json_object_put(live);
+            fail("Memoria insufficiente"); return emit_error();
+        }
+        (void)snprintf(id, length, "model:%s", str(m, "model"));
+        json_object_object_add(m, "id", json_object_new_string(id));
+        json_object_object_add(m, "relation", NULL);
+        free(id);
+    }
+    json_object *o = json_object_new_object();
     json_object_object_add(o, "monitors", live);
     json_object_object_add(o, "pending", read_json("pending.json"));
     json_object *e = read_json("error.json");
     json_object_object_add(o, "error", e ? json_object_get(get(e, "message")) : NULL);
     json_object_put(e);
-    json_object_object_add(o, "relations", json_object_get(get(state, "relations")));
+    /* Retain the v1 response shape; positioning no longer creates dependencies. */
+    json_object_object_add(o, "relations", json_object_new_array());
     json_object_put(state); return emit(o);
 }
 static int response_command(const char *action, const char *token) {
@@ -436,6 +444,59 @@ static bool create_token(char *out, size_t length) {
     for (size_t i = 0; i < sizeof(bytes); i++) (void)snprintf(out + i * 2, length - i * 2, "%02x", (unsigned int)bytes[i]);
     return true;
 }
+enum install_policy { INSTALL_MANUAL, INSTALL_AUTOMATIC };
+struct prepared_change {
+  json_object *live;
+  json_object *state; /* Pre-plan state used for backups and rule ownership. */
+  json_object *plan;
+  json_object *pending; /* Manual only, with phase "applying". */
+  const char *original;
+  const char *updated;
+};
+/* Borrow prepared data and the caller's lock lifetime. Manual success awaits
+ * the caller's confirmation flow; automatic success saves state immediately. */
+static bool install_change(enum install_policy policy, const struct prepared_change *change) {
+  bool manual = policy == INSTALL_MANUAL;
+  /* A reconnect may need the same saved rule reapplied, not new Lua text. */
+  bool needed = manual || strcmp(change->original, change->updated)
+    || !plan_applied(change->live, get(change->plan, "monitors"));
+  if (needed) {
+    bool prepared;
+    if (manual) {
+      remove_state("response.json"); remove_state("error.json");
+      prepared = write_state_text("before.lua", change->original)
+        && write_json("before.json", change->state)
+        && write_json("next.json", get(change->plan, "state"))
+        && write_json("pending.json", change->pending);
+      if (!prepared) {
+        fail("Impossibile salvare il backup monitor"); return false;
+      }
+    } else {
+      prepared = write_state_text("automatic.before.lua", change->original);
+    }
+    bool applied = prepared && write_atomic(config_path, change->updated)
+      && reload_config() && verify_plan(get(change->plan, "monitors"));
+    if (!applied || (manual && stopped)) {
+      char reason[sizeof(error_text)];
+      (void)snprintf(reason, sizeof(reason), "%s", error_text);
+      if (manual) {
+        if (restore_transaction()) fail(*reason ? reason : "Modifica annullata");
+        set_error(error_text);
+      } else {
+        /* Automatic restoration is best-effort, including backup failure. */
+        (void)write_atomic(config_path, change->original);
+        (void)reload_config(); fail(reason);
+      }
+      return false;
+    }
+  }
+  if (manual) {
+    return true;
+  } else {
+    /* Preserve the existing lack of rollback after an automatic save failure. */
+    return write_json("layout.json", get(change->plan, "state"));
+  }
+}
 static int apply_command(int argc, char **argv, bool preview) {
     if (argc < 2 || argc > 5) { fail("Uso: apply MONITOR AZIONE [VALORE] [RIFERIMENTO] [ALLINEAMENTO]"); return emit_error(); }
     int lockfd = lock_file("lock");
@@ -443,7 +504,7 @@ static int apply_command(int argc, char **argv, bool preview) {
     while (lockfd < 0 && !stopped && millis() < lock_deadline) {
         json_object *busy = read_json("pending.json");
         if (busy) { json_object_put(busy); fail("Un'altra modifica è in attesa di conferma"); return emit_error(); }
-        /* The connection watcher briefly owns the same lock during polling.
+        /* The connection watcher briefly owns the same lock during reconciliation.
          * Let an ordinary click wait for it instead of reporting a false pending change. */
         nap(40); lockfd = lock_file("lock");
     }
@@ -456,7 +517,7 @@ static int apply_command(int argc, char **argv, bool preview) {
     json_object *live = live_monitors(), *state = live ? load_state(live) : NULL;
     json_object *plan = state ? monitor_plan(live, state, argv[0], argv[1], argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "", argc > 4 ? argv[4] : "center", error_text, sizeof(error_text)) : NULL;
     char *original = plan ? read_file(config_path) : NULL;
-    char *updated = original ? monitor_configuration(original, get(plan, "monitors"), error_text, sizeof(error_text)) : NULL;
+    char *updated = original ? monitor_configuration(original, get(plan, "monitors"), state, error_text, sizeof(error_text)) : NULL;
     int result = 1;
     if (!plan || !original || !updated) goto out;
     if (preview) { result = emit(json_object_get(plan)); goto out; }
@@ -466,19 +527,17 @@ static int apply_command(int argc, char **argv, bool preview) {
     json_object_object_add(p, "token", json_object_new_string(token));
     json_object_object_add(p, "deadline", json_object_new_int64(0));
     const char *label = !strcmp(argv[1], "position") ? "Posizione" : !strcmp(argv[1], "mode") ? "Risoluzione" :
-        !strcmp(argv[1], "rotation") ? "Rotazione" : !strcmp(argv[1], "scale") ? "Scala" :
+        !strcmp(argv[1], "rotation") ? "Rotazione" :
+        (!strcmp(argv[1], "scale") || !strcmp(argv[1], "scale-preset")) ? "Scala" :
         !strcmp(argv[1], "disable") ? "Disattivazione" : "Attivazione";
     char summary[256]; (void)snprintf(summary, sizeof(summary), "%s · %s", argv[0], label);
     json_object_object_add(p, "summary", json_object_new_string(summary));
     json_object_object_add(p, "phase", json_object_new_string("applying"));
-    remove_state("response.json"); remove_state("error.json");
-    bool prepared = write_state_text("before.lua", original) && write_json("before.json", state) && write_json("next.json", get(plan, "state")) && write_json("pending.json", p);
-    if (!prepared) { json_object_put(p); fail("Impossibile salvare il backup monitor"); goto out; }
-    if (!write_atomic(config_path, updated) || !reload_config() || !verify_plan(get(plan, "monitors")) || stopped) {
-        char reason[sizeof(error_text)]; (void)snprintf(reason, sizeof(reason), "%s", error_text);
-        if (restore_transaction()) fail(*reason ? reason : "Modifica annullata");
-        set_error(error_text); json_object_put(p); goto out;
-    }
+    struct prepared_change change = {
+        .live = live, .state = state, .plan = plan, .pending = p,
+        .original = original, .updated = updated
+    };
+    if (!install_change(INSTALL_MANUAL, &change)) { json_object_put(p); goto out; }
     json_object_object_add(p, "dialogShown", json_object_new_boolean(true));
     if (!write_json("pending.json", p) || !show_confirmation(p)) {
         char reason[sizeof(error_text)]; (void)snprintf(reason, sizeof(reason), "%s", error_text);
@@ -503,16 +562,17 @@ static bool topology_equal(json_object *a, json_object *b) {
     if (!a || !b || json_object_array_length(a) != json_object_array_length(b)) return false;
     for (size_t i = 0; i < json_object_array_length(a); i++) {
         json_object *m = json_object_array_get_idx(a, i), *n = find_monitor(b, str(m, "name"));
-        if (!n || strcmp(str(m, "description"), str(n, "description")) || json_object_get_boolean(get(m, "disabled")) != json_object_get_boolean(get(n, "disabled"))) return false;
+        if (!n || strcmp(str(m, "model"), str(n, "model")) || strcmp(str(m, "description"), str(n, "description")) || json_object_get_boolean(get(m, "disabled")) != json_object_get_boolean(get(n, "disabled"))) return false;
     }
     return true;
 }
 static bool geometry_equal(json_object *a, json_object *b) {
     if (!topology_equal(a, b)) return false;
-    const char *keys[] = {"width", "height", "scale", "transform", NULL};
+    const char *keys[] = {"width", "height", "scale", "transform", "x", "y", NULL};
     for (size_t i = 0; i < json_object_array_length(a); i++) {
         json_object *m = json_object_array_get_idx(a, i), *n = find_monitor(b, str(m, "name"));
         for (size_t j = 0; keys[j]; j++) if (num(m, keys[j]) != num(n, keys[j])) return false;
+        if (!json_object_equal(get(m, "availableModes"), get(n, "availableModes"))) return false;
     }
     return true;
 }
@@ -520,22 +580,120 @@ static bool reconcile_once(json_object *live, bool topology) {
     json_object *state = load_state(live);
     json_object *plan = state ? monitor_reconcile(live, state, topology, error_text, sizeof(error_text)) : NULL;
     char *original = plan ? read_file(config_path) : NULL;
-    char *updated = original ? monitor_configuration(original, get(plan, "monitors"), error_text, sizeof(error_text)) : NULL;
+    char *updated = original ? monitor_configuration(original, get(plan, "monitors"), state, error_text, sizeof(error_text)) : NULL;
     bool ok = updated != NULL;
-    if (ok && strcmp(original, updated)) {
-        ok = write_state_text("automatic.before.lua", original) && write_atomic(config_path, updated) && reload_config() && verify_plan(get(plan, "monitors"));
-        if (!ok) {
-            char reason[sizeof(error_text)]; (void)snprintf(reason, sizeof(reason), "%s", error_text);
-            (void)write_atomic(config_path, original); (void)reload_config(); fail(reason);
-        }
+    if (ok) {
+        struct prepared_change change = {
+            .live = live, .state = state, .plan = plan,
+            .original = original, .updated = updated
+        };
+        ok = install_change(INSTALL_AUTOMATIC, &change);
     }
-    if (ok) ok = write_json("layout.json", get(plan, "state"));
     free(original); free(updated); json_object_put(plan); json_object_put(state);
     return ok;
+}
+struct monitor_events {
+    int socketfd, statefd;
+    char line[4096];
+    size_t used;
+    bool dropping;
+    int64_t reconnect_at;
+};
+static int connect_events(void) {
+    const char *runtime = getenv("XDG_RUNTIME_DIR"), *instance = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (!runtime || !*runtime || !instance || !*instance) return -1;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    int n = snprintf(address.sun_path, sizeof(address.sun_path), "%s/hypr/%s/.socket2.sock", runtime, instance);
+    if (n < 0 || (size_t)n >= sizeof(address.sun_path)) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd >= 0 && connect(fd, (struct sockaddr *)&address, sizeof(address))) { close(fd); return -1; }
+    return fd;
+}
+static bool display_event(const char *line) {
+    const char *names[] = {"monitoradded", "monitoraddedv2", "monitorremoved", "monitorremovedv2", "configreloaded"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        size_t n = strlen(names[i]);
+        if (!strncmp(line, names[i], n) && !strncmp(line + n, ">>", 2)) return true;
+    }
+    return false;
+}
+/* Keep partial lines across reads; ignore window/workspace traffic and bound
+ * memory even if a peer sends an oversized or unterminated event. */
+static bool read_events(struct monitor_events *events) {
+    char buffer[4096];
+    bool changed = false;
+    for (int batch = 0; batch < 64; ++batch) {
+        ssize_t n = read(events->socketfd, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        if (n <= 0) {
+            close(events->socketfd); events->socketfd = -1;
+            events->used = 0; events->dropping = false;
+            events->reconnect_at = millis() + 1000;
+            return true;
+        }
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buffer[i] == '\n') {
+                events->line[events->used] = '\0';
+                if (!events->dropping && display_event(events->line)) changed = true;
+                events->used = 0; events->dropping = false;
+            } else if (!events->dropping) {
+                if (events->used + 1 < sizeof(events->line)) events->line[events->used++] = buffer[i];
+                else { events->used = 0; events->dropping = true; }
+            }
+        }
+    }
+    return changed;
+}
+static bool read_transaction_events(int fd) {
+    /* Aligned storage for the variable-sized inotify_event records. Watching
+     * the directory survives atomic replacement of pending.json. Ignore our
+     * own layout/error writes to avoid self-triggered reconciliation loops. */
+    union { struct inotify_event alignment; char bytes[4096]; } buffer;
+    bool changed = false;
+    for (;;) {
+        ssize_t n = read(fd, buffer.bytes, sizeof(buffer.bytes));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        for (size_t offset = 0; offset < (size_t)n;) {
+            const struct inotify_event *event = (const struct inotify_event *)(buffer.bytes + offset);
+            if ((event->mask & IN_Q_OVERFLOW) || (event->len && !strcmp(event->name, "pending.json"))) changed = true;
+            offset += sizeof(*event) + event->len;
+        }
+    }
+    return changed;
+}
+static void wait_monitor_events(struct monitor_events *events, bool retry_inventory) {
+    if (events->socketfd < 0 && millis() >= events->reconnect_at) {
+        events->socketfd = connect_events();
+        if (events->socketfd >= 0) return; /* Inventory changes during a gap must not be missed. */
+        events->reconnect_at = millis() + 1000;
+    }
+    int timeout = events->socketfd >= 0 && !retry_inventory ? MONITOR_RECHECK_MS : 1000;
+    int64_t deadline = millis() + timeout;
+    while (!stopped) {
+        int64_t remaining = deadline - millis();
+        if (remaining <= 0) return;
+        struct pollfd fds[] = {{events->socketfd, POLLIN, 0}, {events->statefd, POLLIN, 0}};
+        int result = poll(fds, 2, (int)remaining);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) return;
+        bool changed = false;
+        if (fds[0].revents) changed = read_events(events);
+        if (fds[1].revents) changed = read_transaction_events(events->statefd) || changed;
+        if (changed) return;
+    }
 }
 static int daemon_command(void) {
     int daemonfd = lock_file("daemon.lock");
     if (daemonfd < 0) { fail("Il servizio monitor è già attivo"); return emit_error(); }
+    struct monitor_events events = {.socketfd = connect_events(), .statefd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK)};
+    if (events.statefd < 0 || inotify_add_watch(events.statefd, state_dir, IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE) < 0) {
+        if (events.socketfd >= 0) close(events.socketfd);
+        if (events.statefd >= 0) close(events.statefd);
+        close(daemonfd); fail("Impossibile osservare le transazioni monitor"); return emit_error();
+    }
     json_object *previous = NULL;
     bool was_busy = false;
     while (!stopped) {
@@ -547,7 +705,8 @@ static int daemon_command(void) {
             json_object_put(pending); was_busy = true;
         }
         json_object *live = live_monitors();
-        if (live && json_object_array_length(live)) {
+        bool retry_inventory = !live || !json_object_array_length(live);
+        if (!retry_inventory) {
             bool topology = !topology_equal(previous, live);
             bool geometry = !geometry_equal(previous, live);
             if (was_busy) { geometry = false; was_busy = false; }
@@ -570,8 +729,13 @@ static int daemon_command(void) {
             }
             json_object_put(previous); previous = live;
         } else json_object_put(live);
-        close(lockfd); nap(1000);
+        /* A failed/empty read is not a settled inventory. Keep the last good
+         * snapshot and retry soon, even if no further socket event arrives. */
+        close(lockfd);
+        wait_monitor_events(&events, retry_inventory);
     }
+    if (events.socketfd >= 0) close(events.socketfd);
+    close(events.statefd);
     json_object_put(previous); close(daemonfd); return 0;
 }
 static int open_panel(void) {
@@ -588,17 +752,38 @@ static int isolated_apply(int argc, char **argv) {
     while (waitpid(pid, &status, 0) < 0) { if (errno != EINTR) return 1; }
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
+static bool parse_dimension(const char *text, int *dimension) {
+    if (!*text || strspn(text, "0123456789") != strlen(text)) return false;
+    char *end = NULL; errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno || *end || value < 1 || value > 65536) return false;
+    *dimension = (int)value;
+    return true;
+}
+static int scale_options_command(int argc, char **argv) {
+    int width = 0, height = 0;
+    if (argc != 2 || !parse_dimension(argv[0], &width) || !parse_dimension(argv[1], &height)) {
+        fail("Usage: omarchy-monitor-control scale-options WIDTH HEIGHT (integers 1..65536)");
+        return emit_error();
+    }
+    json_object *options = monitor_scale_options(width, height, error_text, sizeof error_text);
+    if (!options) return emit_error();
+    return emit(options);
+}
 int main(int argc, char **argv) {
     struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = on_signal; sigemptyset(&sa.sa_mask);
     (void)sigaction(SIGTERM, &sa, NULL); (void)sigaction(SIGINT, &sa, NULL);
     (void)signal(SIGPIPE, SIG_IGN);
+    /* Pure geometry query: no HOME, compositor, state directory or config IO. */
+    if (argc > 1 && !strcmp(argv[1], "scale-options")) return scale_options_command(argc - 2, argv + 2);
     if (!init_paths()) return emit_error();
     const char *base = strrchr(argv[0], '/'); base = base ? base + 1 : argv[0];
     if (!strcmp(base, "omarchy-monitor-layout")) return open_panel();
     if (!strcmp(base, "omarchy-monitor-apply")) return isolated_apply(argc - 1, argv + 1);
     if (argc == 1 || !strcmp(argv[1], "--help")) {
         puts("omarchy-monitor-control status|open|daemon\n"
-             "omarchy-monitor-control apply|preview MONITOR mode|scale|rotation VALUE\n"
+             "omarchy-monitor-control scale-options WIDTH HEIGHT\n"
+             "omarchy-monitor-control apply|preview MONITOR mode|scale|scale-preset|rotation VALUE\n"
              "omarchy-monitor-control apply|preview MONITOR position left|right|up|down REFERENCE start|center|end\n"
              "omarchy-monitor-control apply|preview MONITOR enable|disable\n"
              "omarchy-monitor-control confirm|revert TOKEN"); return 0;

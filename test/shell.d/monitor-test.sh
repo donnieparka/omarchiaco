@@ -14,46 +14,6 @@ assertEqual(monitor.clampBrightness('nope'), 1, 'monitor rejects invalid brightn
 
 assertEqual(monitor.normalizeScale('1.250'), '1.25', 'monitor normalizes fractional scale')
 assertEqual(monitor.normalizeScale('nope'), '', 'monitor rejects invalid scale')
-assertEqual(monitor.cleanScale(3, 1280, 800), '3.2', 'monitor matches clean VM scale')
-assertEqual(monitor.cleanScale(1.25, 1280, 800), '1.25', 'monitor preserves an already clean scale')
-assertEqual(monitor.cleanScale(1.25, 6016, 3384), '1.33', 'monitor matches clean physical display scale')
-assertEqual(monitor.cleanScale(1.6, 0, 800), '', 'monitor rejects a missing display mode')
-assertEqual(
-  monitor.matchingScaleIndex(['1', '1.25', '1.6', '2', '3', '4'], 3.2, 1280, 800),
-  4,
-  'monitor selects an approximated VM scale'
-)
-assertEqual(
-  monitor.matchingScaleIndex(['1', '1.25', '1.6', '2', '3', '4'], 4, 4, 4),
-  5,
-  'monitor selects an exact preset'
-)
-assertDeepEqual(
-  monitor.availableScales(['1', '1.25', '1.6', '2', '3', '4'], 1280, 800),
-  ['1', '1.25', '1.6', '2', '3', '4'],
-  'monitor keeps distinct approximated VM scales'
-)
-assertDeepEqual(
-  monitor.availableScales(['1', '1.25', '1.6', '2', '3', '4'], 6016, 3384),
-  ['1', '1.25', '1.6', '2', '3', '4'],
-  'monitor keeps distinct approximated physical display scales'
-)
-assertDeepEqual(
-  monitor.availableScales(['1', '1.25', '1.6', '2', '3', '4'], 1280, 804),
-  ['1', '1.25', '2', '4'],
-  'monitor collapses presets with duplicate effective scales'
-)
-assertDeepEqual(
-  monitor.availableScales(['1', '1.25', '1.6', '2', '3', '4'], 5968, 3230),
-  ['1', '2'],
-  'monitor hides presets the current mode cannot reach'
-)
-assertDeepEqual(
-  monitor.availableScales(['1', '1.25', '1.6', '2', '3', '4'], 0, 0),
-  ['1', '1.25', '1.6', '2', '3', '4'],
-  'monitor keeps presets until display dimensions are known'
-)
-
 assertEqual(monitor.brightnessName(96), 'Sun blast', 'monitor names very bright displays')
 assertEqual(monitor.brightnessName(12), 'Candlelit', 'monitor names dim displays')
 
@@ -75,4 +35,25 @@ assertDeepEqual(
 )
 
 assertDeepEqual(monitor.parseDisplays('{'), { displays: [], enabledDisplayCount: 0 }, 'monitor handles invalid display JSON')
+
+const displays = [
+  { name: 'DP-2', model: 'External', width: 1920, height: 1080, scale: 1,
+    relation: { reference: 'eDP-1', direction: 'right', alignment: 'end' } },
+  { name: 'eDP-1', width: 3840, height: 2160, scale: 1.875, relation: null },
+  { name: 'DP-1', width: 0, height: 0, disabled: true, relation: null }
+]
+const originalDisplays = JSON.stringify(displays)
+const presented = monitor.presentMonitors(displays)
+assertDeepEqual(presented.map(display => display.name), ['eDP-1', 'DP-1', 'DP-2'], 'monitor presentation keeps laptop-first ordering')
+assert(presented.every(display => !Object.prototype.hasOwnProperty.call(display, 'relation')), 'monitor presentation excludes obsolete saved relationships')
+assertDeepEqual(monitor.presentMonitors(displays.map(display => Object.assign({}, display, {
+  relation: { reference: 'DP-1', direction: 'up', alignment: 'start' }
+}))), presented, 'legacy relationship changes do not change monitor presentation between polls')
+assertEqual(JSON.stringify(displays), originalDisplays, 'monitor presentation leaves controller data unchanged')
+
+const references = presented.filter(display => display.name !== 'eDP-1' && monitor.isActive(display))
+assertEqual(monitor.referenceName(references, ''), 'DP-2', 'position defaults to the first other active monitor')
+assertEqual(monitor.referenceName(references, 'DP-1'), 'DP-2', 'position replaces an unavailable reference with an active monitor')
+assertEqual(monitor.referenceName([{ name: 'DP-1' }, { name: 'DP-2' }], 'DP-2'), 'DP-2', 'position keeps the selected reference while available')
+assertEqual(monitor.referenceName([], 'DP-2'), '', 'position has no reference when no other active monitor remains')
 JS

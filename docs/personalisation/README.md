@@ -68,11 +68,9 @@ position, rotation, resolution, scale, and enabling/disabling. Position selects
 a reference monitor, a side, and an alignment. Resolution choices come from
 Hyprland's available modes. There is no separate monitor menu.
 
-The C controller calculates positions after scale and rotation. Saved relations
-survive geometry changes. A manual move removes relations involving the moved
-monitor and leaves other monitors in place. Connection changes temporarily
-place remaining displays next to the laptop; saved relations return when their
-monitors reconnect. Manual changes open a large, centered Omarchy confirmation
+The C controller calculates positions from logical dimensions after scale and rotation. Each monitor saves its own coordinates, resolution, scale, rotation and activation preference. Relative placement uses a reference to calculate coordinates once; it does not establish a persistent dependency. Explicit scale, resolution and rotation changes recalculate the active layout while keeping the laptop fixed, or the monitor nearest the origin when no laptop is active. Neighbour sides, alignments, gaps and custom offsets come from the live layout before the command. Scale buttons offer familiar presets only when they produce whole-pixel logical dimensions exactly, without adjusting the selected value. The C controller filters 1, 1.25, 1.5, 1.6, 1.75, 2, 2.5, 3, 3.5 and 4; the panel caches the choices by resolution until it is reloaded. Changing resolution loads the matching choices, while status polls, scale changes and rotation reuse the cache. Preset application rejects a choice if a concurrent resolution change makes it inexact. Existing command-line scale requests remain supported, including normalization of non-exact values. Disconnecting or disabling a monitor does not move the others, and reconnection restores its saved coordinates. Gaps are allowed; layouts that would overlap are rejected. Legacy relations are removed while retaining each saved position. See [independent state](adr/0002-independent-monitor-state.md) and [geometry reflow](adr/0003-geometry-reflow.md).
+
+Manual changes open a large, centered Omarchy confirmation
 dialog with Mantieni and Ripristina, separate from the settings panel. Choosing
 Ripristina, pressing Escape, or letting 15 seconds expire restores the previous
 settings. An independent process owns the transaction, so disabling the monitor
@@ -90,7 +88,7 @@ make test-monitor
 The integration tests use a private simulated Hyprland and need Python 3.
 Python is not a dependency of the installed monitor controller.
 
-Install after backing up existing helpers and `~/.config/hypr/monitors.lua`:
+Install deliberately after testing:
 
 ```bash
 make install-monitor
@@ -125,9 +123,11 @@ Directions are `left`, `right`, `up`, `down`; alignments are `start`, `center`,
 `end`. Other actions are `mode`, `scale`, `rotation` with values, and `enable`
 or `disable` without a value. Rotation uses 0, 1, 2, 3 for 0°, 90°, 180°, 270°.
 
-The controller preserves Lua outside the managed monitor block and unknown
-properties inside recognized rules. Layout state, pending transactions and
-backups live in `$XDG_STATE_HOME/omarchy/monitor-control`, normally
+The controller saves preferences by Hyprland model name. The connector is only the current route used to apply those preferences; switching ports or changing the description or serial does not change the model profile. Two connected monitors with the same model are unsupported and return an error. The managed Lua block contains rules only for currently connected monitors. Stale or ambiguous legacy connector rules are discarded, not assigned to a model and not allowed to block another monitor. Lua outside the managed block is preserved; unknown properties in a managed rule are retained only when its ownership is known. Legacy description profiles retain their preferences until the corresponding monitor reconnects and supplies its model.
+
+An observed activation failure is not a request to disable a monitor. Explicit enable/disable preferences are saved only when the transaction is confirmed. Legacy disabled snapshots without explicit intent stay off until explicitly enabled, but must not cancel a subsequently active display. A new model starts enabled at its advertised preferred mode, scale 1 and normal rotation, with an initial non-overlapping position. An observed disabled state must not stop this first activation or establish a disabled preference, and a reused connector must not supply another model's settings. If a saved mode is temporarily unavailable, the engine uses an advertised fallback without overwriting the preferred geometry, and restores the saved mode when it becomes available again. Verification also checks the monitor model, so replacing a display with a different model on the same connector during application cannot confirm another model's settings.
+
+Layout state, pending transactions and backups live in `$XDG_STATE_HOME/omarchy/monitor-control`, normally
 `~/.local/state/omarchy/monitor-control`. A lock prevents concurrent changes.
 The service recovers an interrupted pending transaction before reconciling.
 It verifies that Hyprland actually applied the settings before asking to keep

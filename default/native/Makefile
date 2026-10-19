@@ -33,12 +33,17 @@ $(BUILD_DIR)/monitor-model-test: $(REPO_DIR)/tests/monitor-model-test.c $(NATIVE
 	mkdir -p "$(BUILD_DIR)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(MONITOR_FLAGS) -I$(NATIVE_DIR) $(REPO_DIR)/tests/monitor-model-test.c $(NATIVE_DIR)monitor-model.c $(LDFLAGS) $(MONITOR_LIBS) -o $@
 
+$(BUILD_DIR)/monitor-reflow-test: $(REPO_DIR)/test/shell.d/fixtures/monitor-reflow.c $(NATIVE_DIR)monitor-model.c $(NATIVE_DIR)monitor-model.h
+	mkdir -p "$(BUILD_DIR)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(MONITOR_FLAGS) -I$(NATIVE_DIR) $(REPO_DIR)/test/shell.d/fixtures/monitor-reflow.c $(NATIVE_DIR)monitor-model.c $(LDFLAGS) $(MONITOR_LIBS) -o $@
+
 $(BUILD_DIR)/monitor-control-test: $(MONITOR_SOURCES) $(NATIVE_DIR)monitor-model.h
 	mkdir -p "$(BUILD_DIR)"
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(MONITOR_FLAGS) -DMONITOR_CONFIRM_SECONDS=2 $(MONITOR_SOURCES) $(LDFLAGS) $(MONITOR_LIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(MONITOR_FLAGS) -DMONITOR_CONFIRM_SECONDS=2 -DMONITOR_RECHECK_MS=5000 $(MONITOR_SOURCES) $(LDFLAGS) $(MONITOR_LIBS) -o $@
 
-test-monitor: $(BUILD_DIR)/monitor-model-test $(BUILD_DIR)/monitor-control-test
+test-monitor: $(BUILD_DIR)/monitor-model-test $(BUILD_DIR)/monitor-reflow-test $(BUILD_DIR)/monitor-control-test
 	$(BUILD_DIR)/monitor-model-test
+	$(BUILD_DIR)/monitor-reflow-test
 	python3 $(REPO_DIR)/tests/run-monitor-control.py $(BUILD_DIR)/monitor-control-test
 
 .PHONY: test-panel-hints install-panel-hints

@@ -75,22 +75,20 @@ static bool valid_live(json_object *live) {
         json_object_array_length(live) > MAX_OUTPUTS) return false;
     for (size_t i = 0; i < json_object_array_length(live); ++i) {
         json_object *m = json_object_array_get_idx(live, i);
-        if (!*str(m, "name")) return false;
-        for (size_t j = 0; j < i; ++j)
-            if (!strcmp(str(m, "name"), str(json_object_array_get_idx(live, j), "name"))) return false;
+        if (!*str(m, "name") || !*str(m, "model")) return false;
+        for (size_t j = 0; j < i; ++j) {
+            json_object *other = json_object_array_get_idx(live, j);
+            if (!strcmp(str(m, "name"), str(other, "name")) ||
+                !strcmp(str(m, "model"), str(other, "model"))) return false;
+        }
     }
     return true;
 }
 static char *identity(json_object *live, json_object *m) {
-    const char *description = str(m, "description");
-    size_t matches = 0;
-    for (size_t i = 0; i < json_object_array_length(live); ++i)
-        if (!strcmp(description, str(json_object_array_get_idx(live, i), "description"))) ++matches;
-    bool unique = *description && matches == 1;
-    const char *value = unique ? description : str(m, "name");
-    size_t size = strlen(value) + 6;
+    (void)live;
+    size_t size = strlen(str(m, "model")) + 7;
     char *id = malloc(size);
-    if (id) (void)snprintf(id, size, "%s%s", unique ? "desc:" : "name:", value);
+    if (id) (void)snprintf(id, size, "model:%s", str(m, "model"));
     return id;
 }
 static json_object *find_monitor(json_object *monitors, const char *key, const char *value) {
@@ -138,15 +136,58 @@ static void set_live_mode(json_object *m) {
     (void)snprintf(mode, sizeof mode, "%dx%d@%.5f", w, h, hz);
     putstr(m, "mode", mode);
 }
+static bool preferred_mode(json_object *m) {
+    json_object *modes = get(m, "availableModes");
+    if (!json_object_is_type(modes, json_type_array)) return false;
+    for (size_t i = 0; i < json_object_array_length(modes); ++i) {
+        const char *raw = json_object_get_string(json_object_array_get_idx(modes, i));
+        char *candidate = normalize_mode(raw ? raw : "");
+        int w = 0, h = 0; double hz = 0;
+        bool usable = candidate && parse_mode(candidate, &w, &h, &hz);
+        if (usable) {
+            putstr(m, "mode", candidate);
+            putint(m, "width", w); putint(m, "height", h); putreal(m, "refreshRate", hz);
+        }
+        free(candidate);
+        if (usable) return true;
+    }
+    return false;
+}
+static bool mode_available(json_object *m, const char *wanted) {
+    if (!*wanted || !strcmp(wanted, "preferred")) return true;
+    json_object *modes = get(m, "availableModes");
+    if (!json_object_is_type(modes, json_type_array)) return true;
+    int ww = 0, wh = 0; double wr = 0;
+    if (!parse_mode(wanted, &ww, &wh, &wr)) return false;
+    for (size_t i = 0; i < json_object_array_length(modes); ++i) {
+        const char *raw = json_object_get_string(json_object_array_get_idx(modes, i));
+        char *candidate = normalize_mode(raw ? raw : "");
+        int w = 0, h = 0; double hz = 0;
+        bool match = candidate && parse_mode(candidate, &w, &h, &hz) &&
+                     w == ww && h == wh && fabs(hz - wr) < 0.02;
+        free(candidate);
+        if (match) return true;
+    }
+    return false;
+}
 static const char *saved_keys[] = {
-    "id", "name", "description", "width", "height", "refreshRate", "scale",
-    "transform", "x", "y", "disabled", "mode"
+    "id", "name", "model", "description", "width", "height", "refreshRate", "scale",
+    "transform", "x", "y", "disabled", "mode", "desiredDisabled"
 };
 static json_object *saved_monitor(json_object *m) {
     json_object *o = json_object_new_object();
     for (size_t k = 0; k < sizeof saved_keys / sizeof saved_keys[0]; ++k) {
         json_object *v = get(m, saved_keys[k]);
         if (v) json_object_object_add(o, saved_keys[k], json_object_get(v));
+    }
+    json_object *desired = get(m, "_desiredGeometry");
+    if (desired) {
+        const char *keys[] = {"mode", "width", "height", "refreshRate", "scale"};
+        for (size_t k = 0; k < sizeof keys / sizeof keys[0]; ++k) {
+            json_object *v = get(desired, keys[k]);
+            if (v) json_object_object_add(o, keys[k], json_object_get(v));
+        }
+        json_object_object_add(o, "modeFallback", json_object_new_boolean(true));
     }
     return o;
 }
@@ -160,11 +201,15 @@ json_object *monitor_initial_state(json_object *live) {
     json_object_object_add(state, "relations", json_object_new_array());
     json_object_object_add(state, "connected", connected);
     for (size_t i = 0; i < json_object_array_length(live); ++i) {
+        /* A first inventory's inactive observation is not a saved preference.
+         * Reconciliation will initialize it from advertised modes instead. */
+        if (!active(json_object_array_get_idx(live, i))) continue;
         json_object *m = copy(json_object_array_get_idx(live, i));
         char *id = identity(live, m);
         if (!m || !id) { json_object_put(m); free(id); json_object_put(state); return NULL; }
         putstr(m, "id", id);
         set_live_mode(m);
+        if (active(m)) json_object_object_add(m, "desiredDisabled", json_object_new_boolean(false));
         json_object_object_add(outputs, id, saved_monitor(m));
         if (active(m)) json_object_array_add(connected, json_object_new_string(id));
         free(id);
@@ -173,14 +218,20 @@ json_object *monitor_initial_state(json_object *live) {
     return state;
 }
 static bool valid_state(json_object *s) {
-    return s && number(s, "version") == 1 &&
-        json_object_is_type(get(s, "outputs"), json_type_object) &&
-        json_object_is_type(get(s, "relations"), json_type_array);
+    if (!s || number(s, "version") != 1 ||
+        !json_object_is_type(get(s, "outputs"), json_type_object) ||
+        !json_object_is_type(get(s, "relations"), json_type_array)) return false;
+    json_object_object_foreach(get(s, "outputs"), id, saved) {
+        (void)id;
+        if (!json_object_is_type(saved, json_type_object)) return false;
+    }
+    return true;
 }
+static bool apply_scale(json_object *m, double requested, char *error, size_t size);
 static json_object *prepare(json_object *live, json_object *input_state,
                             bool import_geometry, char *error, size_t size) {
     if (!valid_live(live) || (input_state && !valid_state(input_state))) {
-        fail(error, size, "Invalid monitor inventory or saved state"); return NULL;
+        fail(error, size, "Invalid saved state or monitor inventory: connected models must be nonempty and unique"); return NULL;
     }
     json_object *state = input_state ? copy(input_state) : monitor_initial_state(live);
     json_object *monitors = copy(live), *plan = json_object_new_object();
@@ -190,6 +241,9 @@ static json_object *prepare(json_object *live, json_object *input_state,
     }
     json_object_object_add(plan, "monitors", monitors);
     json_object_object_add(plan, "state", state);
+    /* Legacy dependencies are discarded; each profile owns absolute coordinates. */
+    json_object_object_add(state, "relations", json_object_new_array());
+    json_object_object_add(state, "fallback", json_object_new_boolean(false));
     json_object *outputs = get(state, "outputs"), *connected = json_object_new_array();
     json_object_object_add(state, "connected", connected);
     for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
@@ -197,20 +251,82 @@ static json_object *prepare(json_object *live, json_object *input_state,
         char *id = identity(live, m);
         if (!id) { json_object_put(plan); fail(error, size, "Out of memory"); return NULL; }
         putstr(m, "id", id);
+        json_object_object_del(m, "_desiredGeometry");
+        json_object_object_del(m, "_newPlacement");
         set_live_mode(m);
         json_object *saved = get(outputs, id);
-        if (saved && !json_object_is_type(saved, json_type_object)) {
-            free(id); json_object_put(plan); fail(error, size, "Invalid saved output"); return NULL;
+        if (!saved && *str(m, "description")) {
+            const char *legacy_id = NULL;
+            json_object_object_foreach(outputs, old_id, old) {
+                if (!strncmp(old_id, "model:", 6) || strcmp(str(old, "description"), str(m, "description"))) continue;
+                if (legacy_id) {
+                    fail(error, size, "Multiple legacy profiles match model %s", str(m, "model"));
+                    free(id); json_object_put(plan); return NULL;
+                }
+                legacy_id = old_id;
+                saved = old;
+            }
+            if (legacy_id) {
+                json_object_object_add(outputs, id, json_object_get(saved));
+                json_object_object_del(outputs, legacy_id);
+            }
         }
+        bool unknown = !input_state || !saved;
+        bool reused_connector = false;
+        json_object_object_foreach(outputs, prior_id, prior) {
+            if (strcmp(prior_id, id) && !strcmp(str(prior, "name"), str(m, "name"))) reused_connector = true;
+        }
+        if (unknown) json_object_object_add(m, "_newPlacement", json_object_new_boolean(true));
+        if (unknown && (!active(m) || reused_connector)) {
+            putreal(m, "scale", 1); putint(m, "transform", 0);
+            putint(m, "x", 0); putint(m, "y", 0);
+            bool usable = preferred_mode(m);
+            if (!usable) {
+                putint(m, "width", 0); putint(m, "height", 0); putstr(m, "mode", "preferred");
+            }
+            json_object_object_add(m, "disabled", json_object_new_boolean(!usable));
+        }
+        if (unknown && active(m))
+            json_object_object_add(m, "desiredDisabled", json_object_new_boolean(false));
+        bool was_active = active(m);
+        json_object *desired = get(saved, "desiredDisabled");
+        bool restore_enabled = saved && (json_object_is_type(desired, json_type_boolean) ?
+                               !json_object_get_boolean(desired) : !flag(saved, "disabled"));
         if (saved) {
+            bool saved_geometry = number(saved, "width") > 0 && number(saved, "height") > 0;
             for (size_t k = 0; k < sizeof saved_keys / sizeof saved_keys[0]; ++k) {
                 const char *key = saved_keys[k];
-                if (!strcmp(key, "id") || !strcmp(key, "name") || !strcmp(key, "description")) continue;
-                if (import_geometry && (!strcmp(key, "width") || !strcmp(key, "height") ||
-                    !strcmp(key, "refreshRate") || !strcmp(key, "scale") ||
-                    !strcmp(key, "transform") || !strcmp(key, "mode"))) continue;
+                if (!strcmp(key, "id") || !strcmp(key, "name") || !strcmp(key, "model") || !strcmp(key, "description") ||
+                    !strcmp(key, "disabled")) continue;
+                if (import_geometry && was_active && (!strcmp(key, "x") || !strcmp(key, "y"))) continue;
+                if ((!saved_geometry || (import_geometry && was_active && !flag(saved, "modeFallback"))) &&
+                    (!strcmp(key, "width") || !strcmp(key, "height") ||
+                     !strcmp(key, "refreshRate") || !strcmp(key, "scale") ||
+                     !strcmp(key, "transform") || !strcmp(key, "mode"))) continue;
                 json_object *v = get(saved, key);
                 if (v) json_object_object_add(m, key, json_object_get(v));
+            }
+            if (json_object_is_type(desired, json_type_boolean))
+                json_object_object_add(m, "disabled", json_object_get(desired));
+            else if (!was_active && saved_geometry && restore_enabled)
+                json_object_object_add(m, "disabled", json_object_new_boolean(false));
+        }
+        if (!was_active && restore_enabled &&
+            (number(m, "width") <= 0 || number(m, "height") <= 0 || flag(m, "disabled"))) {
+            if (preferred_mode(m)) {
+                putreal(m, "scale", 1); putint(m, "transform", 0);
+                json_object_object_add(m, "disabled", json_object_new_boolean(false));
+            }
+        }
+        if (saved && number(saved, "width") > 0 && number(saved, "height") > 0 &&
+            !mode_available(m, str(saved, "mode"))) {
+            json_object_object_add(m, "_desiredGeometry", copy(saved));
+            if (!preferred_mode(m)) {
+                putstr(m, "mode", "preferred");
+                putint(m, "width", 0); putint(m, "height", 0);
+                json_object_object_add(m, "disabled", json_object_new_boolean(true));
+            } else if (!apply_scale(m, real(m, "scale"), error, size)) {
+                free(id); json_object_put(plan); return NULL;
             }
         }
         json_object_object_add(outputs, id, saved_monitor(m));
@@ -229,43 +345,17 @@ static bool logical_size(json_object *m, int *w, int *h) {
     *h = (int)llround((double)height / scale);
     return *w > 0 && *h > 0;
 }
-static bool edge_valid(json_object *edge, json_object *outputs) {
-    const char *a = str(edge, "monitor"), *b = str(edge, "reference");
-    const char *d = str(edge, "direction"), *align = str(edge, "alignment");
-    return *a && *b && strcmp(a, b) && get(outputs, a) && get(outputs, b) &&
-        (!strcmp(d, "left") || !strcmp(d, "right") || !strcmp(d, "up") || !strcmp(d, "down")) &&
-        (!strcmp(align, "start") || !strcmp(align, "center") || !strcmp(align, "end"));
-}
-static bool graph_valid(json_object *state, char *error, size_t size) {
-    json_object *relations = get(state, "relations"), *outputs = get(state, "outputs");
-    size_t n = json_object_array_length(relations);
-    if (n > MAX_OUTPUTS) { fail(error, size, "Too many monitor relations"); return false; }
-    for (size_t i = 0; i < n; ++i) {
-        json_object *edge = json_object_array_get_idx(relations, i);
-        if (!edge_valid(edge, outputs)) { fail(error, size, "Invalid monitor relation"); return false; }
-        const char *source = str(edge, "monitor"), *next = str(edge, "reference");
-        for (size_t j = 0; j < i; ++j)
-            if (!strcmp(source, str(json_object_array_get_idx(relations, j), "monitor"))) {
-                fail(error, size, "A monitor has multiple reference monitors"); return false;
-            }
-        for (size_t depth = 0; depth <= n; ++depth) {
-            if (!strcmp(source, next)) { fail(error, size, "Monitor relations contain a cycle"); return false; }
-            json_object *parent = find_monitor(relations, "monitor", next);
-            if (!parent) break;
-            next = str(parent, "reference");
-            if (depth == n) { fail(error, size, "Monitor relations contain a cycle"); return false; }
-        }
-    }
-    return true;
-}
-static bool place(json_object *m, json_object *reference, json_object *edge,
+static bool place(json_object *m, json_object *reference, const char *d, const char *align,
                    char *error, size_t size) {
+    if ((strcmp(d, "left") && strcmp(d, "right") && strcmp(d, "up") && strcmp(d, "down")) ||
+        (strcmp(align, "start") && strcmp(align, "center") && strcmp(align, "end"))) {
+        fail(error, size, "Invalid direction or alignment"); return false;
+    }
     int w = 0, h = 0, rw = 0, rh = 0;
     if (!logical_size(m, &w, &h) || !logical_size(reference, &rw, &rh)) {
         fail(error, size, "A monitor has no usable video geometry"); return false;
     }
     int64_t x = number(reference, "x"), y = number(reference, "y");
-    const char *d = str(edge, "direction"), *align = str(edge, "alignment");
     bool horizontal = !strcmp(d, "left") || !strcmp(d, "right");
     int delta = horizontal ? rh - h : rw - w;
     int offset = !strcmp(align, "center") ? (int)floor((double)delta / 2.0) :
@@ -276,24 +366,6 @@ static bool place(json_object *m, json_object *reference, json_object *edge,
         fail(error, size, "Monitor position is out of range"); return false;
     }
     putint(m, "x", (int)x); putint(m, "y", (int)y);
-    return true;
-}
-static bool solve_one(json_object *monitors, json_object *relations, json_object *m,
-                       unsigned depth, char *error, size_t size) {
-    if (depth > MAX_OUTPUTS) { fail(error, size, "Monitor relation cycle"); return false; }
-    json_object *edge = find_monitor(relations, "monitor", str(m, "id"));
-    if (!edge || !active(m)) return true;
-    json_object *reference = find_monitor(monitors, "id", str(edge, "reference"));
-    if (!reference || !active(reference)) return true;
-    return solve_one(monitors, relations, reference, depth + 1U, error, size) &&
-           place(m, reference, edge, error, size);
-}
-static bool solve(json_object *plan, char *error, size_t size) {
-    json_object *state = get(plan, "state"), *monitors = get(plan, "monitors");
-    if (!graph_valid(state, error, size)) return false;
-    for (size_t i = 0; i < json_object_array_length(monitors); ++i)
-        if (!solve_one(monitors, get(state, "relations"), json_object_array_get_idx(monitors, i),
-                       0, error, size)) return false;
     return true;
 }
 static bool no_overlap(json_object *monitors, char *error, size_t size) {
@@ -316,6 +388,128 @@ static bool no_overlap(json_object *monitors, char *error, size_t size) {
     }
     return true;
 }
+struct rectangle { int64_t x, y; int w, h; };
+struct attachment {
+    size_t child, parent;
+    const char *direction, *alignment;
+    int64_t gap, offset;
+    long double distance;
+    int overlap;
+};
+static int half_floor(int value) {
+    return value >= 0 ? value / 2 : -((-value + 1) / 2);
+}
+static struct attachment attachment(struct rectangle child, struct rectangle parent) {
+    int64_t dx = child.x >= parent.x + parent.w ? child.x - parent.x - parent.w :
+                 parent.x >= child.x + child.w ? parent.x - child.x - child.w : 0;
+    int64_t dy = child.y >= parent.y + parent.h ? child.y - parent.y - parent.h :
+                 parent.y >= child.y + child.h ? parent.y - child.y - child.h : 0;
+    bool separated_x = child.x >= parent.x + parent.w || parent.x >= child.x + child.w;
+    bool separated_y = child.y >= parent.y + parent.h || parent.y >= child.y + child.h;
+    bool horizontal = separated_x && (!separated_y || dx >= dy);
+    struct attachment result = {0};
+    result.distance = (long double)dx * dx + (long double)dy * dy;
+    result.gap = horizontal ? dx : dy;
+    result.direction = horizontal ? (child.x < parent.x ? "left" : "right") :
+                                   (child.y < parent.y ? "up" : "down");
+    int64_t child_start = horizontal ? child.y : child.x;
+    int64_t parent_start = horizontal ? parent.y : parent.x;
+    int child_extent = horizontal ? child.h : child.w;
+    int parent_extent = horizontal ? parent.h : parent.w;
+    int64_t start = child_start > parent_start ? child_start : parent_start;
+    int64_t end = child_start + child_extent < parent_start + parent_extent ?
+                  child_start + child_extent : parent_start + parent_extent;
+    result.overlap = end > start ? (int)(end - start) : 0;
+    int offsets[] = {half_floor(parent_extent - child_extent), 0, parent_extent - child_extent};
+    const char *alignments[] = {"center", "start", "end"};
+    int64_t actual = child_start - parent_start;
+    result.alignment = alignments[0];
+    result.offset = actual - offsets[0];
+    for (size_t i = 1; i < sizeof offsets / sizeof offsets[0]; ++i) {
+        int64_t candidate = actual - offsets[i];
+        if (llabs(candidate) < llabs(result.offset)) {
+            result.alignment = alignments[i]; result.offset = candidate;
+        }
+    }
+    return result;
+}
+static bool embedded_output(json_object *m) {
+    const char *name = str(m, "name");
+    return !strncmp(name, "eDP-", 4) || !strncmp(name, "LVDS-", 5) || !strncmp(name, "DSI-", 4);
+}
+static long double origin_distance(struct rectangle r) {
+    return (long double)r.x * r.x + (long double)r.y * r.y;
+}
+/* Infer a temporary nearest-neighbour tree from the old rectangles, not saved
+ * dependencies. Keep its root fixed and replay attachments with the new sizes.
+ * Nothing about hotplug, enable or disable invokes this geometry-only operation. */
+static bool reflow(json_object *before, json_object *monitors, char *error, size_t size) {
+    struct rectangle old[MAX_OUTPUTS] = {{0}};
+    bool included[MAX_OUTPUTS] = {false}, placed[MAX_OUTPUTS] = {false};
+    size_t count = json_object_array_length(monitors), remaining = 0, root = count;
+    bool resized = false;
+    for (size_t i = 0; i < count; ++i) {
+        json_object *m = json_object_array_get_idx(monitors, i);
+        json_object *prior = json_object_array_get_idx(before, i);
+        if (!active(m) || !active(prior)) continue;
+        int w = 0, h = 0;
+        if (!logical_size(prior, &old[i].w, &old[i].h) || !logical_size(m, &w, &h)) {
+            fail(error, size, "Invalid monitor geometry"); return false;
+        }
+        old[i].x = number(prior, "x"); old[i].y = number(prior, "y");
+        included[i] = true; ++remaining;
+        resized = resized || w != old[i].w || h != old[i].h;
+        /* A healthy live placement wins over stale saved coordinates. */
+        putint(m, "x", (int)old[i].x); putint(m, "y", (int)old[i].y);
+        json_object *anchor = root < count ? json_object_array_get_idx(before, root) : NULL;
+        if (root == count || (embedded_output(prior) && !embedded_output(anchor)) ||
+            (embedded_output(prior) == embedded_output(anchor) &&
+             (origin_distance(old[i]) < origin_distance(old[root]) ||
+              (origin_distance(old[i]) == origin_distance(old[root]) &&
+               strcmp(str(prior, "name"), str(anchor, "name")) < 0)))) root = i;
+    }
+    if (!resized || remaining < 2) return true;
+    if (!no_overlap(before, error, size)) return false;
+    placed[root] = true; --remaining;
+    while (remaining) {
+        struct attachment best = {0};
+        bool found = false;
+        for (size_t i = 0; i < count; ++i) {
+            if (!included[i] || placed[i]) continue;
+            for (size_t j = 0; j < count; ++j) {
+                if (!placed[j]) continue;
+                struct attachment candidate = attachment(old[i], old[j]);
+                candidate.child = i; candidate.parent = j;
+                int child_order = found ? strcmp(str(json_object_array_get_idx(before, i), "name"),
+                                                 str(json_object_array_get_idx(before, best.child), "name")) : 0;
+                int parent_order = found ? strcmp(str(json_object_array_get_idx(before, j), "name"),
+                                                  str(json_object_array_get_idx(before, best.parent), "name")) : 0;
+                if (!found || candidate.distance < best.distance ||
+                    (candidate.distance == best.distance &&
+                     (candidate.overlap > best.overlap ||
+                      (candidate.overlap == best.overlap &&
+                       (child_order < 0 || (!child_order && parent_order < 0)))))) {
+                    best = candidate; found = true;
+                }
+            }
+        }
+        if (!found) { fail(error, size, "Cannot reconstruct monitor layout"); return false; }
+        json_object *child = json_object_array_get_idx(monitors, best.child);
+        json_object *parent = json_object_array_get_idx(monitors, best.parent);
+        if (!place(child, parent, best.direction, best.alignment, error, size)) return false;
+        int64_t x = number(child, "x"), y = number(child, "y");
+        if (!strcmp(best.direction, "left")) { x -= best.gap; y += best.offset; }
+        else if (!strcmp(best.direction, "right")) { x += best.gap; y += best.offset; }
+        else if (!strcmp(best.direction, "up")) { y -= best.gap; x += best.offset; }
+        else { y += best.gap; x += best.offset; }
+        if (x < INT_MIN || x > INT_MAX || y < INT_MIN || y > INT_MAX) {
+            fail(error, size, "Monitor position is out of range"); return false;
+        }
+        putint(child, "x", (int)x); putint(child, "y", (int)y);
+        placed[best.child] = true; --remaining;
+    }
+    return true;
+}
 static void remember(json_object *plan) {
     json_object *monitors = get(plan, "monitors"), *outputs = get(get(plan, "state"), "outputs");
     json_object *connected = json_object_new_array();
@@ -326,70 +520,61 @@ static void remember(json_object *plan) {
         if (active(m)) json_object_array_add(connected, json_object_new_string(str(m, "id")));
     }
 }
-static bool contains_id(json_object *ids, const char *id) {
-    if (!ids || !json_object_is_type(ids, json_type_array)) return false;
-    for (size_t i = 0; i < json_object_array_length(ids); ++i) {
-        const char *candidate = json_object_get_string(json_object_array_get_idx(ids, i));
-        if (candidate && !strcmp(candidate, id)) return true;
-    }
-    return false;
-}
-static bool topology_fallback(json_object *live, json_object *state) {
-    json_object *previous = get(state, "connected");
-    if (!previous || !json_object_is_type(previous, json_type_array)) return false;
-    bool added = false, removed = false;
-    json_object *current = json_object_new_array();
-    for (size_t i = 0; i < json_object_array_length(live); ++i) {
-        json_object *m = json_object_array_get_idx(live, i);
-        if (!active(m)) continue;
-        char *id = identity(live, m);
-        if (!id) continue;
-        if (!contains_id(previous, id)) added = true;
-        json_object_array_add(current, json_object_new_string(id));
-        free(id);
-    }
-    for (size_t i = 0; i < json_object_array_length(previous); ++i) {
-        const char *id = json_object_get_string(json_object_array_get_idx(previous, i));
-        if (id && !contains_id(current, id)) removed = true;
-    }
-    json_object_put(current);
-    if (added) return false;
-    return removed || flag(state, "fallback");
-}
-static bool compact(json_object *monitors, char *error, size_t size) {
-    json_object *anchor = NULL;
+static bool place_new_outputs(json_object *monitors, char *error, size_t size) {
     for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
         json_object *m = json_object_array_get_idx(monitors, i);
-        if (!active(m)) continue;
-        if (!anchor || !strncmp(str(m, "name"), "eDP", 3) || !strncmp(str(m, "name"), "LVDS", 4)) anchor = m;
-    }
-    if (!anchor) { fail(error, size, "No active monitor remains"); return false; }
-    putint(anchor, "x", 0); putint(anchor, "y", 0);
-    int aw = 0, ah = 0;
-    if (!logical_size(anchor, &aw, &ah)) return false;
-    int x = aw;
-    for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
-        json_object *m = json_object_array_get_idx(monitors, i);
-        if (m == anchor || !active(m)) continue;
+        if (!flag(m, "_newPlacement") || !active(m)) continue;
         int w = 0, h = 0;
-        if (!logical_size(m, &w, &h) || x > INT_MAX - w) {
-            fail(error, size, "Invalid monitor geometry"); return false;
+        if (!logical_size(m, &w, &h)) { fail(error, size, "Invalid monitor geometry"); return false; }
+        int64_t x = number(m, "x"), y = number(m, "y"), right = INT_MIN;
+        bool collision = false;
+        for (size_t j = 0; j < json_object_array_length(monitors); ++j) {
+            json_object *other = json_object_array_get_idx(monitors, j);
+            if (other == m || !active(other) || (j > i && flag(other, "_newPlacement"))) continue;
+            int ow = 0, oh = 0;
+            if (!logical_size(other, &ow, &oh)) { fail(error, size, "Invalid monitor geometry"); return false; }
+            int64_t ox = number(other, "x"), oy = number(other, "y");
+            if (ox + ow > right) right = ox + ow;
+            if (x < ox + ow && ox < x + w && y < oy + oh && oy < y + h) collision = true;
         }
-        putint(m, "x", x); putint(m, "y", (int)floor((double)(ah - h) / 2.0));
-        x += w;
+        if (collision) {
+            if (right > INT_MAX) { fail(error, size, "Monitor position is out of range"); return false; }
+            putint(m, "x", (int)right); putint(m, "y", 0);
+        }
     }
     return true;
 }
 static int gcd_int(int a, int b) { while (b) { int t = b; b = a % b; a = t; } return a; }
+/* A scale in 1/120 units produces whole logical pixels iff it divides this. */
+static int scale_divisor(int width, int height, char *error, size_t size) {
+    if (width <= 0 || height <= 0 || width > 65536 || height > 65536) {
+        fail(error, size, "Monitor has no active video mode; choose a resolution first"); return 0;
+    }
+    return gcd_int(width * 120, height * 120);
+}
+json_object *monitor_scale_options(int width, int height, char *error, size_t size) {
+    if (error && size) error[0] = '\0';
+    int divisor = scale_divisor(width, height, error, size);
+    if (!divisor) return NULL;
+    const int presets[] = {120, 150, 180, 192, 210, 240, 300, 360, 420, 480};
+    json_object *options = json_object_new_array();
+    if (!options) { fail(error, size, "Out of memory"); return NULL; }
+    for (size_t i = 0; i < sizeof presets / sizeof presets[0]; ++i) {
+        if (divisor % presets[i]) continue;
+        json_object *value = json_object_new_double((double)presets[i] / 120.0);
+        if (!value || json_object_array_add(options, value) != 0) {
+            json_object_put(value); json_object_put(options);
+            fail(error, size, "Out of memory"); return NULL;
+        }
+    }
+    return options;
+}
 static bool apply_scale(json_object *m, double requested, char *error, size_t size) {
-    int width = number(m, "width"), height = number(m, "height");
     if (!isfinite(requested) || requested < 1 || requested > 4) {
         fail(error, size, "Scale must be between 1 and 4"); return false;
     }
-    if (width <= 0 || height <= 0 || width > 65536 || height > 65536) {
-        fail(error, size, "Monitor has no active video mode; choose a resolution first"); return false;
-    }
-    int divisor = gcd_int(width * 120, height * 120);
+    int divisor = scale_divisor(number(m, "width"), number(m, "height"), error, size);
+    if (!divisor) return false;
     int units = (int)floor(requested * 120 + 0.5);
     if (units > divisor) units = divisor;
     while (divisor % units) ++units;
@@ -425,50 +610,35 @@ json_object *monitor_plan(json_object *live, json_object *state, const char *nam
     if (!name || !action) { fail(error, size, "Monitor and action are required"); return NULL; }
     if (!value) value = "";
     if (!alignment || !*alignment) alignment = "center";
-    json_object *plan = prepare(live, state, false, error, size);
+    bool strict_scale = !strcmp(action, "scale-preset");
+    bool scale_action = strict_scale || !strcmp(action, "scale");
+    bool geometry_action = scale_action || !strcmp(action, "mode") || !strcmp(action, "rotation");
+    json_object *plan = prepare(live, state, geometry_action, error, size);
     if (!plan) return NULL;
-    json_object *monitors = get(plan, "monitors"), *updated = get(plan, "state");
+    json_object *monitors = get(plan, "monitors");
     json_object *m = find_monitor(monitors, "name", name);
     if (!m) { fail(error, size, "Monitor is no longer connected"); goto invalid; }
-    bool moved = false;
     if (!strcmp(action, "position")) {
-        /* A manual move affects only the selected monitor, even after fallback. */
-        for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
-            json_object *item = json_object_array_get_idx(monitors, i);
-            json_object *actual = find_monitor(live, "name", str(item, "name"));
-            putint(item, "x", number(actual, "x"));
-            putint(item, "y", number(actual, "y"));
-        }
-        json_object *ref = find_monitor(monitors, "name", reference);
         json_object *live_target = find_monitor(live, "name", name);
         json_object *live_reference = find_monitor(live, "name", reference);
-        if (!active(live_target) || !ref || !active(live_reference) || ref == m) {
+        if (!active(live_target) || !active(live_reference) || live_target == live_reference) {
             fail(error, size, "Choose a different active reference monitor"); goto invalid;
         }
-        json_object *edge = json_object_new_object();
-        putstr(edge, "monitor", str(m, "id")); putstr(edge, "reference", str(ref, "id"));
-        putstr(edge, "direction", value); putstr(edge, "alignment", alignment);
-        if (!edge_valid(edge, get(updated, "outputs"))) {
-            json_object_put(edge); fail(error, size, "Invalid direction or alignment"); goto invalid;
-        }
-        json_object *relations = get(updated, "relations"), *next = json_object_new_array();
-        for (size_t i = 0; i < json_object_array_length(relations); ++i) {
-            json_object *old = json_object_array_get_idx(relations, i);
-            if (strcmp(str(old, "monitor"), str(m, "id")) && strcmp(str(old, "reference"), str(m, "id")))
-                json_object_array_add(next, json_object_get(old));
-        }
-        json_object_array_add(next, edge);
-        json_object_object_add(updated, "relations", next);
-        if (!graph_valid(updated, error, size) || !place(m, ref, edge, error, size)) goto invalid;
-        json_object_object_add(updated, "fallback", json_object_new_boolean(false));
-        moved = true;
+        if (!place(m, live_reference, value, alignment, error, size)) goto invalid;
+        json_object_object_del(m, "_newPlacement");
     } else if (!strcmp(action, "mode")) {
         if (!apply_mode(m, value, error, size)) goto invalid;
-    } else if (!strcmp(action, "scale")) {
+        json_object_object_del(m, "_desiredGeometry");
+    } else if (scale_action) {
         char *end = NULL; errno = 0;
         double requested = strtod(value, &end);
         if (errno || end == value || *end) { fail(error, size, "Invalid monitor scale"); goto invalid; }
         if (!apply_scale(m, requested, error, size)) goto invalid;
+        if (strict_scale && fabs(real(m, "scale") - requested) > 1e-12) {
+            fail(error, size, "Scale preset is not supported by the current video mode"); goto invalid;
+        }
+        json_object *desired = get(m, "_desiredGeometry");
+        if (desired && !apply_scale(desired, real(m, "scale"), error, size)) goto invalid;
     } else if (!strcmp(action, "rotation")) {
         if (strlen(value) != 1 || value[0] < '0' || value[0] > '3') {
             fail(error, size, "Rotation must be 0, 1, 2 or 3"); goto invalid;
@@ -488,12 +658,11 @@ json_object *monitor_plan(json_object *live, json_object *state, const char *nam
                 !apply_mode(m, json_object_get_string(json_object_array_get_idx(modes, 0)), error, size)) goto invalid;
         }
         json_object_object_add(m, "disabled", json_object_new_boolean(disable));
-        json_object_object_add(updated, "fallback", json_object_new_boolean(disable));
+        json_object_object_add(m, "desiredDisabled", json_object_new_boolean(disable));
     } else { fail(error, size, "Unknown monitor action"); goto invalid; }
-    if (!moved && !solve(plan, error, size)) goto invalid;
+    if (geometry_action && !reflow(live, monitors, error, size)) goto invalid;
+    if (!place_new_outputs(monitors, error, size) || !no_overlap(monitors, error, size)) goto invalid;
     remember(plan);
-    if (flag(updated, "fallback") && !compact(monitors, error, size)) goto invalid;
-    if (!no_overlap(monitors, error, size)) goto invalid;
     return plan;
 invalid:
     json_object_put(plan);
@@ -504,12 +673,9 @@ json_object *monitor_reconcile(json_object *live, json_object *state, bool topol
     if (error && size) error[0] = '\0';
     json_object *plan = prepare(live, state, !topology_changed, error, size);
     if (!plan) return NULL;
-    if (topology_changed)
-        json_object_object_add(get(plan, "state"), "fallback", json_object_new_boolean(topology_fallback(live, state)));
-    if (!solve(plan, error, size)) goto invalid;
+    if (!place_new_outputs(get(plan, "monitors"), error, size) ||
+        !no_overlap(get(plan, "monitors"), error, size)) goto invalid;
     remember(plan);
-    if (flag(get(plan, "state"), "fallback") && !compact(get(plan, "monitors"), error, size)) goto invalid;
-    if (!no_overlap(get(plan, "monitors"), error, size)) goto invalid;
     return plan;
 invalid:
     json_object_put(plan); return NULL;
@@ -518,11 +684,33 @@ invalid:
 struct field { char key[64]; const char *start, *end; };
 struct rule { struct field fields[64]; size_t count; const char *closing; char *output; };
 static const char *skipspace(const char *p) { while (*p && isspace((unsigned char)*p)) ++p; return p; }
-static bool safe_name(const char *name) {
-    if (!*name) return false;
-    for (const char *p = name; *p; ++p)
-        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '_' && *p != '-') return false;
-    return true;
+static char *lua_string(const char *value) {
+    /* Decimal escapes work in Lua as well as JSON for ASCII controls only
+     * when avoided: use Lua's named escapes and reject other control bytes. */
+    struct text out = {0};
+    if (!adds(&out, "\"")) return NULL;
+    for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
+        const char *escape = NULL;
+        switch (*p) {
+        case '"': escape = "\\\""; break;
+        case '\\': escape = "\\\\"; break;
+        case '\n': escape = "\\n"; break;
+        case '\r': escape = "\\r"; break;
+        case '\t': escape = "\\t"; break;
+        case '\b': escape = "\\b"; break;
+        case '\f': escape = "\\f"; break;
+        default: break;
+        }
+        if ((*p < 32 && !escape) ||
+            !(escape ? adds(&out, escape) : append(&out, (const char *)p, 1))) {
+            free(out.data); return NULL;
+        }
+    }
+    if (!adds(&out, "\"")) { free(out.data); return NULL; }
+    return out.data;
+}
+static const char *selector(json_object *m) {
+    return str(m, "name");
 }
 static bool parse_rule(const char *line, struct rule *rule) {
     memset(rule, 0, sizeof *rule);
@@ -597,17 +785,33 @@ static bool parse_rule(const char *line, struct rule *rule) {
     }
     return false;
 }
-static json_object *matching_output(json_object *monitors, const char *output) {
-    json_object *m = find_monitor(monitors, "name", output);
-    if (m || strncmp(output, "desc:", 5)) return m;
-    for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
-        json_object *candidate = json_object_array_get_idx(monitors, i);
-        if (!strcmp(str(candidate, "description"), output + 5)) return candidate;
+static json_object *matching_output(json_object *state, json_object *monitors, const char *output) {
+    json_object *owner = NULL, *outputs = get(state, "outputs");
+    const char *owner_id = NULL;
+    if (outputs) {
+        json_object_object_foreach(outputs, id, saved) {
+            bool match = !strncmp(output, "desc:", 5) ?
+                         !strcmp(str(saved, "description"), output + 5) : !strcmp(str(saved, "name"), output);
+            if (!match) continue;
+            if (owner) return NULL;
+            owner = saved; owner_id = id;
+        }
     }
-    return NULL;
+    if (!owner) return state ? NULL : find_monitor(monitors, "name", output);
+    if (!strncmp(owner_id, "model:", 6)) return find_monitor(monitors, "model", owner_id + 6);
+    json_object *match = NULL;
+    if (!*str(owner, "description")) return NULL;
+    for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
+        json_object *m = json_object_array_get_idx(monitors, i);
+        if (strcmp(str(owner, "description"), str(m, "description"))) continue;
+        if (match) return NULL;
+        match = m;
+    }
+    return match;
 }
 static char *lua_value(json_object *m, const char *key) {
     char text[160];
+    if (!strcmp(key, "output")) return lua_string(selector(m));
     if (!strcmp(key, "position")) {
         (void)snprintf(text, sizeof text, "\"%dx%d\"", number(m, "x"), number(m, "y"));
         return strdup(text);
@@ -642,7 +846,7 @@ static char *lua_value(json_object *m, const char *key) {
     }
     return NULL;
 }
-static const char *config_keys[] = {"mode", "position", "scale", "transform", "disabled"};
+static const char *config_keys[] = {"output", "mode", "position", "scale", "transform", "disabled"};
 static bool patch_rule(struct text *out, const char *line, struct rule *rule, json_object *m) {
     bool seen[sizeof config_keys / sizeof config_keys[0]] = {false};
     const char *cursor = line;
@@ -675,20 +879,22 @@ static bool patch_rule(struct text *out, const char *line, struct rule *rule, js
     return adds(out, insert);
 }
 static bool new_rule(struct text *out, json_object *m) {
-    const char *name = str(m, "name");
-    if (!safe_name(name) || !adds(out, "hl.monitor({ output = \"") || !adds(out, name) || !adds(out, "\"")) return false;
+    if (!adds(out, "hl.monitor({ ")) return false;
     for (size_t k = 0; k < sizeof config_keys / sizeof config_keys[0]; ++k) {
         char *value = lua_value(m, config_keys[k]);
         if (!value) return false;
-        bool ok = adds(out, ", ") && adds(out, config_keys[k]) && adds(out, " = ") && adds(out, value);
+        bool ok = (k == 0 || adds(out, ", ")) && adds(out, config_keys[k]) && adds(out, " = ") && adds(out, value);
         free(value);
         if (!ok) return false;
     }
     return adds(out, " })\n");
 }
-char *monitor_configuration(const char *original, json_object *monitors, char *error, size_t size) {
+char *monitor_configuration(const char *original, json_object *monitors, json_object *state,
+                            char *error, size_t size) {
     if (error && size) error[0] = '\0';
-    if (!original || !valid_live(monitors)) { fail(error, size, "Invalid monitor configuration input"); return NULL; }
+    if (!original || !valid_live(monitors) || (state && !valid_state(state))) {
+        fail(error, size, "Invalid monitor configuration input"); return NULL;
+    }
     const char *begin = strstr(original, BEGIN), *end = strstr(original, END);
     if ((begin == NULL) != (end == NULL) ||
         (begin && (strstr(begin + strlen(BEGIN), BEGIN) || strstr(end + strlen(END), END) || end < begin ||
@@ -698,7 +904,16 @@ char *monitor_configuration(const char *original, json_object *monitors, char *e
     }
     struct text result = {0};
     json_object *seen = json_object_new_object(), *updated = json_object_new_object();
-    if (!seen || !updated) goto invalid;
+    json_object *profiles = json_object_new_object();
+    if (!seen || !updated || !profiles) goto invalid;
+    for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
+        json_object *m = copy(json_object_array_get_idx(monitors, i));
+        char *id = m ? identity(monitors, m) : NULL;
+        if (!id) { json_object_put(m); goto invalid; }
+        putstr(m, "id", id);
+        json_object_object_add(profiles, id, m);
+        free(id);
+    }
     if (begin) {
         if (!append(&result, original, (size_t)(begin - original)) || !adds(&result, BEGIN "\n")) goto invalid;
         const char *cursor = begin + strlen(BEGIN) + 1;
@@ -714,22 +929,16 @@ char *monitor_configuration(const char *original, json_object *monitors, char *e
             }
             struct rule rule;
             if (!parse_rule(line, &rule)) { free(line); fail(error, size, "Unrecognized managed monitor rule"); goto invalid; }
-            if (get(seen, rule.output)) {
-                free(rule.output); free(line); fail(error, size, "Duplicate managed monitor rule"); goto invalid;
-            }
+            json_object *m = get(seen, rule.output) ? NULL : matching_output(state, monitors, rule.output);
             json_object_object_add(seen, rule.output, json_object_new_boolean(true));
-            json_object *m = matching_output(monitors, rule.output);
             bool ok = true;
-            if (m) {
-                if (get(updated, str(m, "name"))) {
-                    fail(error, size, "Multiple managed rules match the same monitor"); ok = false;
-                } else {
-                    ok = patch_rule(&result, line, &rule, m);
-                    json_object_object_add(updated, str(m, "name"), json_object_new_boolean(true));
-                }
-            } else ok = adds(&result, line);
+            if (m && !get(updated, str(m, "model"))) {
+                ok = patch_rule(&result, line, &rule, m) && adds(&result, "\n");
+                json_object_object_add(updated, str(m, "model"), json_object_new_boolean(true));
+            }
+            /* Stale or ambiguously owned managed rules are deliberately dropped. */
             free(rule.output); free(line);
-            if (!ok || !adds(&result, "\n")) goto invalid;
+            if (!ok) goto invalid;
             cursor = newline + 1;
         }
     } else {
@@ -737,15 +946,15 @@ char *monitor_configuration(const char *original, json_object *monitors, char *e
         if (result.length && result.data[result.length - 1] != '\n' && !adds(&result, "\n")) goto invalid;
         if (!adds(&result, "\n" BEGIN "\n")) goto invalid;
     }
-    for (size_t i = 0; i < json_object_array_length(monitors); ++i) {
-        json_object *m = json_object_array_get_idx(monitors, i);
-        if (!get(updated, str(m, "name")) && !new_rule(&result, m)) goto invalid;
+    json_object_object_foreach(profiles, profile_id, m) {
+        (void)profile_id;
+        if (!get(updated, str(m, "model")) && !new_rule(&result, m)) goto invalid;
     }
     if (!adds(&result, END) || !adds(&result, end ? end + strlen(END) : "\n")) goto invalid;
-    json_object_put(seen); json_object_put(updated);
+    json_object_put(seen); json_object_put(updated); json_object_put(profiles);
     return result.data;
 invalid:
-    json_object_put(seen); json_object_put(updated); free(result.data);
+    json_object_put(seen); json_object_put(updated); json_object_put(profiles); free(result.data);
     if (error && size && !*error) fail(error, size, "Invalid monitor rule or out of memory");
     return NULL;
 }

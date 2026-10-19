@@ -15,14 +15,13 @@ Panel {
   property string controlExecutable: "omarchy-monitor-control"
   property var displays: []
   property var pending: null
-  property var relations: []
   property string backendError: ""
   property string commandError: ""
   property string focusedDisplay: ""
   property var expandedDisplays: ({})
   property var editors: ({})
+  property var scaleOptions: ({})
   property real wheelAccumulator: 0
-  readonly property var scalePresets: ["1", "1.25", "1.6", "2", "3", "4"]
   readonly property int enabledCount: displays.filter(function(d) { return Model.isActive(d) }).length
   readonly property bool changing: actionProc.running || pending !== null
   readonly property string errorMessage: commandError || backendError
@@ -51,11 +50,7 @@ Panel {
     expandedDisplays = next
   }
   function editor(name) {
-    var saved = null
-    for (var i = 0; i < displays.length; i++)
-      if (displays[i].name === name) saved = displays[i].relation
-    return Object.assign({ kind: "", side: saved ? saved.direction : "left",
-      alignment: saved ? saved.alignment : "center", reference: saved ? saved.reference : "" }, editors[name] || {})
+    return Object.assign({ kind: "", side: "left", alignment: "center", reference: "" }, editors[name] || {})
   }
   function updateEditor(name, fields) {
     var next = Object.assign({}, editors)
@@ -64,6 +59,20 @@ Panel {
   }
   function toggleEditor(name, kind) {
     updateEditor(name, { kind: editor(name).kind === kind ? "" : kind })
+  }
+  function loadScaleOptions() {
+    if (scaleProc.running) return
+    var request = Model.nextScaleRequest(displays, scaleOptions)
+    if (!request) return
+    scaleProc.resolutionKey = request.key
+    scaleProc.command = [controlExecutable, "scale-options", String(request.width), String(request.height)]
+    scaleProc.running = true
+  }
+  function retryScaleOptions(key) {
+    var next = Object.assign({}, scaleOptions)
+    delete next[key]
+    scaleOptions = next
+    loadScaleOptions()
   }
   function refresh() {
     if (!stateProc.running && !actionProc.running) stateProc.running = true
@@ -77,8 +86,8 @@ Panel {
     // Keep inline selections and slider gestures intact between status polls.
     if (JSON.stringify(next) !== JSON.stringify(displays)) displays = next
     pending = state.pending || null
-    relations = state.relations || []
     backendError = state.error || ""
+    loadScaleOptions()
   }
   function runAction(args) {
     if (actionProc.running) return
@@ -111,7 +120,11 @@ Panel {
       return "ok"
     }
     function state(): string {
-      return JSON.stringify({ displays: root.displays, pending: root.pending, error: root.errorMessage,
+      // Keep the legacy diagnostic field without carrying relationships in UI state.
+      var displays = root.displays.map(function(display) {
+        return Object.assign({}, display, { relation: null })
+      })
+      return JSON.stringify({ displays: displays, pending: root.pending, error: root.errorMessage,
         expanded: root.displays.filter(function(d) { return root.isExpanded(d.name) }).map(function(d) { return d.name }) })
     }
   }
@@ -154,6 +167,30 @@ Panel {
       root.refresh()
     }
   }
+  Process {
+    id: scaleProc
+    property string resolutionKey: ""
+    stdout: StdioCollector { id: scaleOutput; waitForEnd: true }
+    stderr: StdioCollector { id: scaleErrors; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      var entry = { values: [], error: "" }
+      try {
+        if (exitCode !== 0) throw new Error(String(scaleErrors.text).trim() || "Impossibile leggere le scale disponibili.")
+        var values = JSON.parse(scaleOutput.text)
+        if (!Array.isArray(values) || !values.length || values.some(function(value) {
+          return typeof value !== "number" || !isFinite(value) || value <= 0
+        })) throw new Error("Risposta non valida per le scale disponibili.")
+        entry.values = values
+      } catch (error) {
+        entry.error = String(error.message || error)
+      }
+      // Cache failures too: polling must not repeatedly spawn a failing helper.
+      var next = Object.assign({}, root.scaleOptions)
+      next[resolutionKey] = entry
+      root.scaleOptions = next
+      Qt.callLater(root.loadScaleOptions)
+    }
+  }
   Timer {
     interval: 1000
     running: root.opened
@@ -187,7 +224,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(statusColumn.implicitHeight + panelColumn.implicitHeight + Style.space(14), Style.space(720))
+    contentHeight: panel.fittedContentHeight(statusColumn.implicitHeight + panelColumn.implicitHeight + Style.space(14))
 
     Item {
       id: keyCatcher
@@ -319,13 +356,13 @@ Panel {
     readonly property var editorState: root.editor(display.name)
     readonly property var references: root.displays.filter(function(d) { return d.name !== card.display.name && Model.isActive(d) })
     readonly property string referenceName: Model.referenceName(references, editorState.reference)
-    readonly property var scales: Model.availableScales(root.scalePresets, display.width, display.height)
     readonly property var modes: Model.availableModes(display)
+    readonly property var scaleChoices: root.scaleOptions[Model.scaleKey(display)]
     property int brightness: -1
     spacing: Style.space(10)
 
     function readBrightness() {
-      if (expanded && active && !brightnessRead.running && !brightnessWrite.running)
+      if (laptop && expanded && active && !brightnessRead.running && !brightnessWrite.running)
         brightnessRead.running = true
     }
     Component.onCompleted: readBrightness()
@@ -511,24 +548,38 @@ Panel {
       }
 
       Column {
-        visible: card.editorState.kind === "scale"
+        visible: card.editorState.kind === "scale" && card.active
         width: parent.width
         spacing: Style.space(8)
         enabled: !root.changing && card.active
-        SectionLabel { text: "SCALA" }
+        SectionLabel { text: "SCALA · " + Model.normalizeScale(card.display.scale) + "×" }
         Flow {
           width: parent.width
           spacing: Style.spacing.xs
           Repeater {
-            model: card.expanded && card.editorState.kind === "scale" ? card.scales : []
+            model: card.expanded && card.editorState.kind === "scale" && card.scaleChoices ? card.scaleChoices.values : []
             ActionButton {
-              required property string modelData
-              required property int index
-              text: (Model.cleanScale(modelData, card.display.width, card.display.height) || modelData) + "×"
-              active: Model.matchingScaleIndex(card.scales, card.display.scale, card.display.width, card.display.height) === index
-              onClicked: root.applyChange(card.display.name, "scale", modelData)
+              required property real modelData
+              text: Model.normalizeScale(modelData) + "×"
+              active: Model.isCurrentScale(modelData, card.display)
+              onClicked: root.applyChange(card.display.name, "scale-preset", modelData)
             }
           }
+        }
+        Text {
+          textFormat: Text.PlainText
+          visible: !card.scaleChoices || card.scaleChoices.error !== ""
+          width: parent.width
+          text: card.scaleChoices ? card.scaleChoices.error : "Caricamento scale…"
+          wrapMode: Text.WordWrap
+          color: Qt.darker(root.bar.foreground, 1.3)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+        ActionButton {
+          visible: !!card.scaleChoices && card.scaleChoices.error !== ""
+          text: "Riprova"
+          onClicked: root.retryScaleOptions(Model.scaleKey(card.display))
         }
       }
 

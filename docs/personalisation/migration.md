@@ -4,9 +4,10 @@ The personalisation previously maintained in `donnieparka/omarchy-personalisatio
 
 ## Included controls
 
-- The monitor panel selects resolutions from Hyprland's reported modes and controls scale, rotation, activation, and position.
-- Relative placement persists through resolution, scale, rotation, and connection changes. Left and right placement defaults to aligned centers. Moving a monitor manually removes its placement relations. Disconnected monitors no longer leave a gap in the connected layout.
+- The monitor panel selects resolutions from Hyprland's reported modes and controls scale, rotation, activation, and position. Scale buttons offer familiar presets that produce whole-pixel logical dimensions exactly. The C controller calculates the choices, which the panel caches by resolution; polling does not recalculate them. If the resolution changes before a preset is applied, the controller rejects an inexact choice instead of adjusting it. Command-line scaling remains unchanged.
+- Each monitor remembers its own position and settings. Relative placement computes coordinates once, defaulting to aligned centers for left/right placement. Explicit scale, resolution and rotation changes recalculate the active layout using the new logical dimensions, keeping the laptop fixed when active. Without an active laptop, the monitor nearest the origin stays fixed. Disconnecting or disabling a monitor leaves the others in place; gaps are allowed. Legacy positioning relations are removed without changing saved coordinates. See [the geometry reflow decision](adr/0003-geometry-reflow.md).
 - Display changes open a separate confirmation popup with Keep and Revert actions. A separate watchdog restores the previous configuration after 15 seconds without confirmation.
+- The monitor daemon listens to Hyprland's `.socket2.sock` for monitor add/remove and configuration reload events instead of querying every second. It watches `pending.json` changes with inotify so confirmation completion and abandoned transactions still wake it. A 60-second inventory check catches geometry or EDID changes that Hyprland does not announce; while the event socket is unavailable it retries and checks inventory every second. The open panel still refreshes status every second.
 - Tray panels show letter shortcuts beside actions. Wi-Fi and Bluetooth entries retain their labels while the panel is open as devices appear and disappear. Badges stay inside panel bounds; text fields retain normal typing behavior.
 - SSH askpass uses a C bridge and a trusted shell service to show the observed caller context.
 - `wl-kbptr` remains a separate keyboard mouse selector. `Super+Ctrl+M` starts smart selection and `Super+Ctrl+Shift+M` starts the grid.
@@ -55,6 +56,10 @@ Run focused tests from the checkout:
 make all test test-monitor test-panel-hints
 ./test/cli
 bash test/shell.d/monitor-test.sh
+bash test/shell.d/monitor-scale-presets-test.sh
+bash test/shell.d/monitor-scale-options-test.sh
+bash test/shell.d/monitor-reflow-test.sh
+bash test/shell.d/monitor-events-test.sh
 bash test/shell.d/panel-command-path-test.sh
 bash test/shell.d/bin-style-test.sh
 bash test/shell.d/manifest-entrypoints-test.sh

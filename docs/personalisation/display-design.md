@@ -1,5 +1,7 @@
 # Impostazioni dei monitor
 
+Nota storica: le relazioni persistenti e la compattazione descritte sotto sono state superate dalle decisioni dell'utente del 7 ottobre 2026: [stato indipendente per monitor](adr/0002-independent-monitor-state.md) e [ricalcolo dopo un cambio di geometria](adr/0003-geometry-reflow.md). Posizione, geometria e attivazione appartengono al singolo monitor. Scala, risoluzione e rotazione applicate dal controller ricalcolano la disposizione mantenendo fermo il portatile attivo; scollegamento e disattivazione non spostano gli altri monitor. Le verifiche sul desktop riportate qui riguardano la versione del 6 ottobre, non la nuova patch isolata.
+
 Progetto confermato dall'utente e implementato il 6 ottobre 2026. Motore C, servizio e popup QML installati. Verificati sul desktop reale il caricamento del popup, l'applicazione della disposizione HP a sinistra di Xiaomi e il ripristino automatico dopo 15 secondi senza conferma. Dopo il passaggio alla conferma centrale Omarchy, la disposizione HP a sinistra di Xiaomi è stata confermata e salvata: HP a (-4115,120), Xiaomi a (-3440,0), portatile a (0,0). Nessuna transazione pendente e nessun errore Hyprland al controllo finale.
 
 ## Richieste
@@ -55,3 +57,11 @@ Backup precedente all'installazione: `/home/iaco/.local/state/omarchy/monitor-mi
 - `bin/omarchy-monitor-apply` accetta posizioni automatiche generiche, senza un monitor di riferimento.
 - `shell/plugins/panels/monitor/Panel.qml` chiude il popup per avviare `omarchy-monitor-layout --monitor` tramite il pulsante `Resolution & layout…`.
 - `shell.json` contiene sia il tray `omarchy.tray` sia il widget display `iaco.monitor`.
+
+## Selezione della scala verificata l'8 ottobre 2026
+
+Il campo di testo è stato sostituito da pulsanti per scale compatibili. Il motore C filtra i valori 1, 1.25, 1.5, 1.6, 1.75, 2, 2.5, 3, 3.5 e 4 senza correggere quelli incompatibili a valori diversi. Il popup conserva le scelte per risoluzione; stato periodico, scala, rotazione e connettore non invalidano la cache. Una nuova risoluzione richiede le scelte corrispondenti. L'applicazione di un preset rifiuta un valore diventato incompatibile prima del comando; la scala libera da CLI conserva la normalizzazione precedente.
+
+Sul desktop con il portatile a 3840×2160 e scala corrente 1.875, verificati i pulsanti 1, 1.25, 1.5, 1.6, 2, 2.5, 3 e 4 su due righe, senza sovrapposizioni. La scala corrente resta visibile senza selezionare un preset diverso. Un adattatore temporaneo di verifica ha registrato dieci letture dello stato e un solo calcolo delle scelte, poi ha intercettato il comando del pulsante come `apply eDP-1 scale-preset 1` senza applicarlo. Configurazione e preferenze salvate sono rimaste identiche. L'adattatore non fa parte del codice distribuito.
+
+Questa verifica grafica riguarda la selezione della scala, non il nuovo ricalcolo geometrico. I test nativi coprono i valori compatibili, il rifiuto dei valori incompatibili e il mantenimento del comportamento CLI.
